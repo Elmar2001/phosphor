@@ -30,5 +30,3 @@ src-tauri/pm3-libs/
 # Firmware .elf files (download from proxmarkbuilds.org)
 src-tauri/firmware/
 
-CLAUDE.md
-.claude/
