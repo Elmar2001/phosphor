@@ -64,9 +64,9 @@ fn pm3_scope_names() -> Vec<&'static str> {
 
 /// Validates that a port string matches expected serial port patterns.
 /// Accepts COM1-COM256+ (Windows), /dev/ttyACM0-99, /dev/ttyUSB0-99 (Linux),
-/// and /dev/tty.usbmodem* (macOS).
+/// /dev/tty.usbmodem* and /dev/cu.usbmodem* (macOS).
 static PORT_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^(COM[1-9]\d*|/dev/tty(ACM|USB)\d{1,2}|/dev/tty\.usbmodem\w+)$")
+    Regex::new(r"^(COM[1-9]\d*|/dev/tty(ACM|USB)\d{1,2}|/dev/(tty|cu)\.usbmodem\w+)$")
         .expect("bad port regex")
 });
 
@@ -480,8 +480,19 @@ pub async fn detect_device(app: &AppHandle) -> Result<(String, String, String), 
 
     emit_output(app, "[!!] No Proxmark3 found.", true);
     emit_output(app, "[=] Try a different USB cable (some are charge-only)", false);
-    emit_output(app, "[=] Check Device Manager for a COM port", false);
-    emit_output(app, "[=] PM3 Easy: may need CH340 driver (wch-ic.com)", false);
+
+    if cfg!(target_os = "windows") {
+        emit_output(app, "[=] Check Device Manager for a COM port", false);
+        emit_output(app, "[=] PM3 Easy: may need CH340 driver (wch-ic.com)", false);
+    } else if cfg!(target_os = "macos") {
+        emit_output(app, "[=] Check System Information > USB for the device", false);
+        emit_output(app, "[=] PM3 Easy: may need CH340 driver (wch-ic.com/downloads)", false);
+        emit_output(app, "[=] Try: ls /dev/tty.usbmodem* in Terminal", false);
+    } else {
+        emit_output(app, "[=] Check dmesg or lsusb for the device", false);
+        emit_output(app, "[=] You may need to add your user to the 'dialout' group", false);
+    }
+
     Err(AppError::DeviceNotFound)
 }
 
@@ -494,17 +505,43 @@ fn build_port_candidates() -> Vec<String> {
             ports.push(format!("COM{}", i));
         }
     } else if cfg!(target_os = "macos") {
-        // macOS: /dev/tty.usbmodem* -- cover common PM3 suffixes
-        for suffix in &[
-            "iceman1",
-            "14101",
-            "14201",
-            "14301",
-            "1",
-            "2",
-            "3",
-        ] {
-            ports.push(format!("/dev/tty.usbmodem{}", suffix));
+        // macOS: dynamically scan /dev/ for tty.usbmodem* devices.
+        // This catches any PM3 serial number suffix rather than relying on
+        // a hardcoded list. Falls back to common suffixes if the scan fails.
+        if let Ok(entries) = std::fs::read_dir("/dev") {
+            let mut dynamic: Vec<String> = entries
+                .filter_map(|e| e.ok())
+                .map(|e| e.file_name().to_string_lossy().to_string())
+                .filter(|name| name.starts_with("tty.usbmodem"))
+                .map(|name| format!("/dev/{}", name))
+                .collect();
+            dynamic.sort();
+            ports.extend(dynamic);
+        }
+
+        // Also add well-known suffixes as fallback (in case /dev scan raced
+        // with device enumeration).
+        for suffix in &["iceman1", "14101", "14201", "14301", "1", "2", "3"] {
+            let path = format!("/dev/tty.usbmodem{}", suffix);
+            if !ports.contains(&path) {
+                ports.push(path);
+            }
+        }
+
+        // macOS can also present PM3 via /dev/cu.usbmodem* (calling-unit side).
+        // Some setups prefer cu.* over tty.* for outbound serial connections.
+        if let Ok(entries) = std::fs::read_dir("/dev") {
+            let cu_ports: Vec<String> = entries
+                .filter_map(|e| e.ok())
+                .map(|e| e.file_name().to_string_lossy().to_string())
+                .filter(|name| name.starts_with("cu.usbmodem"))
+                .map(|name| format!("/dev/{}", name))
+                .collect();
+            for p in cu_ports {
+                if !ports.contains(&p) {
+                    ports.push(p);
+                }
+            }
         }
     } else {
         // Linux: /dev/ttyACM* and /dev/ttyUSB*

@@ -2,7 +2,7 @@
 
 Desktop GUI for Proxmark3. Scan, clone and manage RFID/NFC cards without touching the command line.
 
-![Windows](https://img.shields.io/badge/Windows-10%2B-blue) ![License](https://img.shields.io/badge/license-GPL--3.0-green) ![Version](https://img.shields.io/badge/version-1.1.0-brightgreen)
+![Windows](https://img.shields.io/badge/Windows-10%2B-blue) ![macOS](https://img.shields.io/badge/macOS-10.15%2B-silver) ![License](https://img.shields.io/badge/license-GPL--3.0-green) ![Version](https://img.shields.io/badge/version-1.1.0-brightgreen)
 
 ## What it does
 
@@ -27,17 +27,29 @@ T5577 (LF), Gen1a, Gen2/CUID, Gen3, Gen4 GTU, Gen4 GDM/USCUID (HF)
 ## Requirements
 
 - **Proxmark3** device (Easy, RDV4, or compatible clone)
-- **Windows 10** or later (x64)
+- **Windows 10** or later (x64), or **macOS 10.15** (Catalina) or later (Intel or Apple Silicon)
 - USB cable (data cable, not charge-only)
 
 Proxmark3 firmware v4.20728+ recommended. Phosphor bundles its own PM3 client binary, so you don't need a separate Proxmark3 installation.
 
+**macOS note:** PM3 Easy boards may require the CH340 USB-serial driver from [wch-ic.com](https://www.wch-ic.com/downloads/CH341SER_MAC_ZIP.html). On Apple Silicon Macs with Homebrew, the Proxmark3 client is typically at `/opt/homebrew/bin/proxmark3`.
+
 ## Installation
+
+### Windows
 
 1. Download `Phosphor_1.1.0_x64-setup.exe` from [Releases](../../releases)
 2. Run the installer
 3. Plug in your Proxmark3
 4. Launch Phosphor
+
+### macOS
+
+1. Download `Phosphor_1.1.0_aarch64.dmg` (Apple Silicon) or `Phosphor_1.1.0_x64.dmg` (Intel) from [Releases](../../releases)
+2. Open the `.dmg` and drag Phosphor to Applications
+3. On first launch: right-click → Open (to bypass Gatekeeper for unsigned builds)
+4. Plug in your Proxmark3
+5. Launch Phosphor
 
 ## Features
 
@@ -59,10 +71,12 @@ git clone https://github.com/nikitaart2000/phosphor.git
 cd phosphor
 npm install
 npx tauri dev      # development
-npx tauri build    # production build
+npx tauri build    # production build (NSIS on Windows, DMG on macOS)
 ```
 
-The PM3 client binary and its DLLs go in `src-tauri/binaries/` and `src-tauri/pm3-libs/`. See `tauri.conf.json` for the resource mapping.
+The PM3 client binary and its libraries go in `src-tauri/binaries/` and `src-tauri/pm3-libs/`. See `tauri.conf.json` for the resource mapping.
+
+**macOS build note:** On macOS, `npx tauri build` produces a `.dmg` and `.app` bundle. The sidecar binary in `src-tauri/binaries/` must be compiled for the target architecture (x86_64 or aarch64). Name it `proxmark3-aarch64-apple-darwin` or `proxmark3-x86_64-apple-darwin` per Tauri sidecar conventions.
 
 ## Tech stack
 

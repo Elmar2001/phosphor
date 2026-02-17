@@ -55,7 +55,7 @@ pub struct FirmwareProgress {
 const VALID_VARIANTS: &[&str] = &["rdv4", "rdv4-bt", "generic", "generic-256"];
 
 static PORT_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^(COM[1-9]\d*|/dev/tty(ACM|USB)\d{1,2}|/dev/tty\.usbmodem\w+)$")
+    Regex::new(r"^(COM[1-9]\d*|/dev/tty(ACM|USB)\d{1,2}|/dev/(tty|cu)\.usbmodem\w+)$")
         .expect("bad port regex")
 });
 
@@ -185,9 +185,9 @@ pub async fn flash_firmware(
         "-w",
     ];
 
-    // Try sidecar first (works in dev mode). In NSIS installs the sidecar
-    // binary lives in the root install dir, NOT in binaries/, so the sidecar
-    // lookup fails with os error 3. Fall back to scope-based lookup — same
+    // Try sidecar first (works in dev mode). In production installs the
+    // sidecar binary may live outside the binaries/ subdirectory, so the
+    // sidecar lookup can fail. Fall back to scope-based lookup — same
     // strategy as connection::run_command().
     let sidecar_result = match app.shell().sidecar("binaries/proxmark3") {
         Ok(cmd) => cmd.args(&flash_args).output().await.ok(),

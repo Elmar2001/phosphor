@@ -27,7 +27,7 @@
   },
   "bundle": {
     "active": true,
-    "targets": ["nsis"],
+    "targets": "all",
     "externalBin": ["binaries/proxmark3"],
     "resources": {
       "pm3-libs/*": "./",
@@ -45,6 +45,12 @@
     ],
     "copyright": "Copyright 2025-2026 nik shuv",
     "shortDescription": "Proxmark3 GUI for one-click card cloning",
+    "category": "Utility",
+    "macOS": {
+      "minimumSystemVersion": "10.15",
+      "signingIdentity": null,
+      "entitlements": null
+    },
     "windows": {
       "nsis": {
         "installMode": "both",

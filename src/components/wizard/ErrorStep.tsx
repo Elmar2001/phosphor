@@ -27,12 +27,28 @@ function getRetryLabel(action: RecoveryAction | null | undefined, source?: strin
   }
 }
 
-const DETECT_HINTS = [
-  'Try a different USB cable (some cables are charge-only)',
-  'Check Device Manager for a COM port (Ports section)',
-  'PM3 Easy may need CH340 driver — download from wch-ic.com',
-  'Antivirus may block proxmark3.exe — add it to exceptions',
-];
+function getDetectHints(): string[] {
+  const isMac = navigator.platform?.toLowerCase().includes('mac');
+  const isWin = navigator.platform?.toLowerCase().includes('win');
+
+  const hints = ['Try a different USB cable (some cables are charge-only)'];
+
+  if (isMac) {
+    hints.push('Check System Information → USB for the device');
+    hints.push('PM3 Easy may need CH340 driver — download from wch-ic.com/downloads');
+    hints.push('Run "ls /dev/tty.usbmodem*" in Terminal to check for serial ports');
+  } else if (isWin) {
+    hints.push('Check Device Manager for a COM port (Ports section)');
+    hints.push('PM3 Easy may need CH340 driver — download from wch-ic.com');
+    hints.push('Antivirus may block proxmark3.exe — add it to exceptions');
+  } else {
+    hints.push('Check dmesg or lsusb for the device');
+    hints.push('You may need to add your user to the "dialout" group');
+    hints.push('PM3 Easy may need CH340 driver — download from wch-ic.com');
+  }
+
+  return hints;
+}
 
 export function ErrorStep({ message, recoverable, recoveryAction, errorSource, onRetry, onReset }: ErrorStepProps) {
   const sfx = useSfx();
@@ -40,6 +56,7 @@ export function ErrorStep({ message, recoverable, recoveryAction, errorSource, o
   const displayMessage = message || 'An unexpected error occurred.';
   const retryLabel = getRetryLabel(recoveryAction, errorSource);
   const showDetectHints = errorSource === 'detect' && !message?.includes('firmware');
+  const detectHints = showDetectHints ? getDetectHints() : [];
 
   return (
     <TerminalPanel title="ERROR">
@@ -57,7 +74,7 @@ export function ErrorStep({ message, recoverable, recoveryAction, errorSource, o
             <div style={{ color: 'var(--green-mid)', marginBottom: '4px' }}>
               [?] Troubleshooting:
             </div>
-            {DETECT_HINTS.map((hint, i) => (
+            {detectHints.map((hint, i) => (
               <div key={i} style={{ color: 'var(--green-dim)', paddingLeft: '12px' }}>
                 {`${i + 1}. ${hint}`}
               </div>
