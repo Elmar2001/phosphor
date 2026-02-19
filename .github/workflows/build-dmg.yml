@@ -37,6 +37,9 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
+      - name: Create firmware directories
+        run: mkdir -p src-tauri/firmware/rdv4 src-tauri/firmware/rdv4-bt src-tauri/firmware/generic
+
       - name: Build Tauri app
         uses: tauri-apps/tauri-action@v0.6.1
         env:
