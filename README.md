@@ -76,7 +76,7 @@ npx tauri build    # production build (NSIS on Windows, DMG on macOS)
 
 The PM3 client binary and its libraries go in `src-tauri/binaries/` and `src-tauri/pm3-libs/`. See `tauri.conf.json` for the resource mapping.
 
-**macOS build note:** On macOS, `npx tauri build` produces a `.dmg` and `.app` bundle. The sidecar binary in `src-tauri/binaries/` must be compiled for the target architecture (x86_64 or aarch64). Name it `proxmark3-aarch64-apple-darwin` or `proxmark3-x86_64-apple-darwin` per Tauri sidecar conventions.
+**macOS build note:** On macOS, `npx tauri build` produces a `.dmg` and `.app` bundle. For the built app to connect to Proxmark3, install the Proxmark3 client via Homebrew. Either tap works: `brew install rfidresearchgroup/proxmark3/proxmark3` (RFID Research Group) or `brew tap proxmark/proxmark3 && brew install proxmark3` (Proxmark). The app uses the binary at `/opt/homebrew/bin/proxmark3` (Apple Silicon) or `/usr/local/bin/proxmark3` (Intel). The bundled sidecar has Homebrew dylib dependencies that are not included in the DMG.
 
 ## Tech stack
 
