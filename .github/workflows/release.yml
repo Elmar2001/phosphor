@@ -1,0 +1,54 @@
+name: Release
+
+# Creates a GitHub release with DMG when pushing a version tag (e.g. v1.1.0)
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  release:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            arch: aarch64
+          # - target: x86_64-apple-darwin
+          #   arch: x64
+
+    runs-on: macos-latest
+
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build and publish release
+        uses: tauri-apps/tauri-action@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: Phosphor ${{ github.ref_name }}
+          releaseBody: |
+            ## Installation
+            - **macOS (Apple Silicon)**: Download `Phosphor_*_aarch64.dmg`, open it, and drag Phosphor to Applications.
+            - On first launch: right-click → Open (to bypass Gatekeeper for unsigned builds).
+            - Install Proxmark3 via Homebrew: `brew install rfidresearchgroup/proxmark3/proxmark3`
+          releaseDraft: true
+          args: --target ${{ matrix.target }}
