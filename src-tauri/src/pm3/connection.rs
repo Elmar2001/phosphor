@@ -1,3 +1,4 @@
+use std::path::Path;
 use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 
@@ -6,6 +7,7 @@ use serde::Serialize;
 use tauri::{AppHandle, Emitter};
 use tauri_plugin_shell::process::{CommandChild, CommandEvent};
 use tauri_plugin_shell::ShellExt;
+use tokio::process::Command as TokioCommand;
 use tokio::time::timeout;
 
 use crate::error::AppError;
@@ -98,14 +100,20 @@ async fn execute_pm3(app: &AppHandle, port: &str, cmd: &str) -> Result<String, A
         ));
     }
 
-    // 1) Try bundled sidecar binary first (available in production builds).
-    //    In dev mode the sidecar won't exist, so this silently falls through.
-    match try_sidecar_silent(app, port, cmd).await {
-        Ok(output) => return Ok(output),
-        Err(_) => { /* sidecar not available -- fall through to PATH/scope lookup */ }
+    // On macOS DMG: Tauri shell plugin fails to spawn external binaries. Use
+    // native tokio::process::Command first (bypasses shell plugin).
+    #[cfg(target_os = "macos")]
+    if let Ok(output) = try_native_pm3_macos(port, cmd).await {
+        return Ok(output);
     }
 
-    // 2) Fall back to PATH-based lookup, then common install locations.
+    // Sidecar first, then PATH/scope lookup.
+    match try_sidecar_silent(app, port, cmd).await {
+        Ok(output) => return Ok(output),
+        Err(_) => { /* fall through */ }
+    }
+
+    // PATH-based lookup, then common install locations.
     // Each scope name maps to a binary path registered in capabilities/default.json.
     let scope_names = pm3_scope_names();
     let mut first_spawn_error: Option<AppError> = None;
@@ -171,7 +179,7 @@ async fn execute_pm3(app: &AppHandle, port: &str, cmd: &str) -> Result<String, A
         };
     }
 
-    // All scope names exhausted -- return the first spawn error (from PATH lookup)
+    // All options exhausted -- return the first spawn error (from PATH lookup)
     // so the error message is the most user-recognizable one.
     Err(first_spawn_error.unwrap_or_else(|| {
         AppError::CommandFailed("Failed to spawn proxmark3: binary not found".into())
@@ -308,14 +316,12 @@ fn spawn_pm3(
 ) -> Result<(tauri::async_runtime::Receiver<CommandEvent>, CommandChild), AppError> {
     let args = ["-p", port, "-f", "-c", cmd];
 
-    // Try sidecar first
     if let Ok(sidecar_cmd) = app.shell().sidecar("binaries/proxmark3") {
         if let Ok(result) = sidecar_cmd.args(&args).spawn() {
             return Ok(result);
         }
     }
 
-    // Fall back to scope names
     let scope_names = pm3_scope_names();
     let mut first_err: Option<String> = None;
 
@@ -552,6 +558,66 @@ fn build_port_candidates() -> Vec<String> {
     }
 
     ports
+}
+
+/// On macOS, run proxmark3 via tokio::process::Command using known Homebrew paths.
+/// Bypasses the Tauri shell plugin which can fail to spawn external binaries when
+/// the app is launched from a DMG (Hardened Runtime / capability restrictions).
+#[cfg(target_os = "macos")]
+async fn try_native_pm3_macos(port: &str, cmd: &str) -> Result<String, AppError> {
+    const MAC_PATHS: &[&str] = &["/opt/homebrew/bin/proxmark3", "/usr/local/bin/proxmark3"];
+
+    for path in MAC_PATHS {
+        if !Path::new(path).exists() {
+            continue;
+        }
+
+        let output_future = TokioCommand::new(path)
+            .args(["-p", port, "-f", "-c", cmd])
+            .output();
+
+        match timeout(PM3_COMMAND_TIMEOUT, output_future).await {
+            Err(_) => {
+                return Err(AppError::Timeout(format!(
+                    "PM3 command timed out after {}s: {}",
+                    PM3_COMMAND_TIMEOUT.as_secs(),
+                    cmd
+                )));
+            }
+            Ok(Err(_)) => continue,
+            Ok(Ok(output)) => {
+                let code = output.status.code().unwrap_or(-1);
+                let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+                let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+                return match code {
+                    0 => {
+                        let cleaned = strip_ansi(&stdout);
+                        Ok(cleaned)
+                    }
+                    -5 | 251 => Err(AppError::Timeout(format!(
+                        "PM3 timed out running: {}",
+                        cmd
+                    ))),
+                    _ => {
+                        let detail = if stderr.is_empty() {
+                            strip_ansi(&stdout)
+                        } else {
+                            strip_ansi(&stderr)
+                        };
+                        Err(AppError::CommandFailed(format!(
+                            "Exit code {}: {}",
+                            code, detail
+                        )))
+                    }
+                };
+            }
+        }
+    }
+
+    Err(AppError::CommandFailed(
+        "proxmark3 not found at /opt/homebrew/bin or /usr/local/bin".into(),
+    ))
 }
 
 /// Attempt to run a PM3 command via the bundled sidecar binary (silent -- no emit).
