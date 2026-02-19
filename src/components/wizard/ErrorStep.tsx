@@ -34,6 +34,7 @@ function getDetectHints(): string[] {
   const hints = ['Try a different USB cable (some cables are charge-only)'];
 
   if (isMac) {
+    hints.push('Install Proxmark3: brew install rfidresearchgroup/proxmark3/proxmark3');
     hints.push('Check System Information → USB for the device');
     hints.push('PM3 Easy may need CH340 driver — download from wch-ic.com/downloads');
     hints.push('Run "ls /dev/tty.usbmodem*" in Terminal to check for serial ports');
