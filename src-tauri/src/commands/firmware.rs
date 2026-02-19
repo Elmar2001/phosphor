@@ -185,42 +185,34 @@ pub async fn flash_firmware(
         "-w",
     ];
 
-    // Try sidecar first (works in dev mode). In production installs the
-    // sidecar binary may live outside the binaries/ subdirectory, so the
-    // sidecar lookup can fail. Fall back to scope-based lookup — same
-    // strategy as connection::run_command().
-    let sidecar_result = match app.shell().sidecar("binaries/proxmark3") {
+    let scope_names: Vec<&str> = if cfg!(target_os = "windows") {
+        vec!["proxmark3", "proxmark3-win-c", "proxmark3-win-progfiles"]
+    } else if cfg!(target_os = "macos") {
+        vec!["proxmark3", "proxmark3-mac-local", "proxmark3-mac-brew"]
+    } else {
+        vec!["proxmark3", "proxmark3-linux-local", "proxmark3-linux-usr"]
+    };
+
+    let _ = app.emit(
+        "firmware-progress",
+        FirmwareProgress {
+            phase: "writing".into(),
+            percent: 30,
+            message: "Flashing firmware (this may take up to 60 seconds)...".into(),
+        },
+    );
+
+    let mut output = match app.shell().sidecar("binaries/proxmark3") {
         Ok(cmd) => cmd.args(&flash_args).output().await.ok(),
         Err(_) => None,
     };
 
-    let output = if let Some(output) = sidecar_result {
-        output
-    } else {
-        // Sidecar not available — try scope names (PATH, common install paths)
-        let scope_names: Vec<&str> = if cfg!(target_os = "windows") {
-            vec!["proxmark3", "proxmark3-win-c", "proxmark3-win-progfiles"]
-        } else if cfg!(target_os = "macos") {
-            vec!["proxmark3", "proxmark3-mac-local", "proxmark3-mac-brew"]
-        } else {
-            vec!["proxmark3", "proxmark3-linux-local", "proxmark3-linux-usr"]
-        };
-
-        let _ = app.emit(
-            "firmware-progress",
-            FirmwareProgress {
-                phase: "writing".into(),
-                percent: 30,
-                message: "Flashing firmware (this may take up to 60 seconds)...".into(),
-            },
-        );
-
-        let mut last_err = String::from("No PM3 binary found");
-        let mut found = None;
+    let mut last_err = String::from("No PM3 binary found");
+    if output.is_none() {
         for name in &scope_names {
             match app.shell().command(name).args(&flash_args).output().await {
                 Ok(out) => {
-                    found = Some(out);
+                    output = Some(out);
                     break;
                 }
                 Err(e) => {
@@ -228,20 +220,20 @@ pub async fn flash_firmware(
                 }
             }
         }
+    }
 
-        match found {
-            Some(out) => out,
-            None => {
-                let _ = app.emit(
-                    "firmware-failed",
-                    FirmwareProgress {
-                        phase: "error".into(),
-                        percent: 0,
-                        message: format!("PM3 binary not found for flash: {}", last_err),
-                    },
-                );
-                return Ok(());
-            }
+    let output = match output {
+        Some(o) => o,
+        None => {
+            let _ = app.emit(
+                "firmware-failed",
+                FirmwareProgress {
+                    phase: "error".into(),
+                    percent: 0,
+                    message: format!("PM3 binary not found for flash: {}", last_err),
+                },
+            );
+            return Ok(());
         }
     };
 
