@@ -42,6 +42,9 @@ pub fn emit_output<R: Runtime>(app: &AppHandle<R>, text: &str, is_error: bool) {
 /// Maximum time to wait for a PM3 subprocess to complete (30 seconds).
 const PM3_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// How long to keep reading output after a streaming process reports exit.
+const STREAM_DRAIN_GRACE: Duration = Duration::from_secs(2);
+
 /// Inactivity limit for a firmware flash. The client itself waits up to 20 s
 /// (`-w`) for the bootloader port to reappear between phases.
 const PM3_FLASH_TIMEOUT: Duration = Duration::from_secs(300);
@@ -389,36 +392,48 @@ where
 {
     let mut accumulated = String::new();
     let mut exit_code: Option<i32> = None;
+    // Set once Terminated arrives; output may still be in flight until then.
+    let mut drain_deadline: Option<Instant> = None;
 
     loop {
-        match timeout(inactivity_timeout, rx.recv()).await {
-            Err(_) => {
-                return Err(AppError::Timeout(format!(
-                    "PM3 produced no output for {}s",
-                    inactivity_timeout.as_secs()
-                )));
-            }
-            Ok(None) => {
-                // Channel closed — process exited
-                break;
-            }
-            Ok(Some(event)) => match event {
-                CommandEvent::Stdout(bytes) => {
-                    handle_stream_line(app, &bytes, false, on_line, &mut accumulated);
-                }
-                CommandEvent::Stderr(bytes) => {
-                    handle_stream_line(app, &bytes, true, on_line, &mut accumulated);
-                }
-                CommandEvent::Error(msg) => {
-                    emit_output(app, &msg, true);
-                    return Err(AppError::CommandFailed(format!("Process error: {}", msg)));
-                }
-                CommandEvent::Terminated(payload) => {
-                    exit_code = payload.code;
-                    break;
-                }
-                _ => {} // Future CommandEvent variants — ignore
+        let next = match drain_deadline {
+            Some(deadline) => match timeout_at(deadline, rx.recv()).await {
+                Ok(next) => next,
+                Err(_) => break,
             },
+            None => match timeout(inactivity_timeout, rx.recv()).await {
+                Ok(next) => next,
+                Err(_) => {
+                    return Err(AppError::Timeout(format!(
+                        "PM3 produced no output for {}s",
+                        inactivity_timeout.as_secs()
+                    )));
+                }
+            },
+        };
+        let Some(event) = next else {
+            // Channel closed: the process exited and both pipes hit EOF.
+            break;
+        };
+        match event {
+            CommandEvent::Stdout(bytes) => {
+                handle_stream_line(app, &bytes, false, on_line, &mut accumulated);
+            }
+            CommandEvent::Stderr(bytes) => {
+                handle_stream_line(app, &bytes, true, on_line, &mut accumulated);
+            }
+            CommandEvent::Error(msg) => {
+                emit_output(app, &msg, true);
+                return Err(AppError::CommandFailed(format!("Process error: {}", msg)));
+            }
+            CommandEvent::Terminated(payload) => {
+                // The shell plugin can deliver Terminated before the last
+                // lines of a process that exits quickly, so keep reading
+                // until the pipes close instead of stopping here.
+                exit_code = payload.code;
+                drain_deadline = Some(Instant::now() + STREAM_DRAIN_GRACE);
+            }
+            _ => {} // Future CommandEvent variants — ignore
         }
     }
 
@@ -744,6 +759,56 @@ mod tests {
         assert_eq!(out.code, Some(0));
         assert!(out.stdout.contains("line 1") && out.stdout.contains("line 2"));
         assert!(out.stderr.contains("warn"));
+    }
+
+    #[tokio::test]
+    async fn stream_keeps_output_that_arrives_after_termination() {
+        let app = tauri::test::mock_app();
+        let (tx, rx) = tauri::async_runtime::channel(8);
+        tx.send(CommandEvent::Stdout(b"[+] Flashing...\n".to_vec()))
+            .await
+            .unwrap();
+        tx.send(CommandEvent::Terminated(TerminatedPayload {
+            code: Some(0),
+            signal: None,
+        }))
+        .await
+        .unwrap();
+        tx.send(CommandEvent::Stdout(b"[+] All done\n".to_vec()))
+            .await
+            .unwrap();
+        drop(tx);
+
+        let mut lines = Vec::new();
+        let out =
+            read_stream_with_timeout(app.handle(), rx, Duration::from_secs(5), &mut |l: &str| {
+                lines.push(l.to_string())
+            })
+            .await
+            .unwrap();
+        assert!(out.contains("All done"));
+        assert_eq!(lines, vec!["[+] Flashing...", "[+] All done"]);
+    }
+
+    #[tokio::test]
+    async fn stream_stops_draining_after_grace_period() {
+        let app = tauri::test::mock_app();
+        let (tx, rx) = tauri::async_runtime::channel(8);
+        tx.send(CommandEvent::Terminated(TerminatedPayload {
+            code: Some(0),
+            signal: None,
+        }))
+        .await
+        .unwrap();
+        // `tx` stays alive, like a pipe held open by a leftover grandchild.
+        let started = std::time::Instant::now();
+        let out =
+            read_stream_with_timeout(app.handle(), rx, Duration::from_secs(60), &mut |_: &str| {})
+                .await
+                .unwrap();
+        assert!(out.is_empty());
+        assert!(started.elapsed() < Duration::from_secs(10));
+        drop(tx);
     }
 
     #[tokio::test]
