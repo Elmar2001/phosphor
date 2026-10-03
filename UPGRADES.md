@@ -22,7 +22,7 @@ This replaces an earlier upgrade attempt (commits `6e6393a` through
 | Setup problems | "Device not found" for everything | DIAG tab: client launch check, real port list, firmware, overrides, copyable report |
 | Overrides | None | Preferred port and custom client path in Settings, stored in the database |
 | Webview permissions | Could spawn `proxmark3` with any arguments | No shell permissions |
-| Tests | 225 Rust parser/builder tests | 270 Rust tests (incl. fake-client process tests) + 24 frontend tests |
+| Tests | 225 Rust parser/builder tests | 272 Rust tests (incl. fake-client process tests) + 24 frontend tests |
 | CI | None | Linux, Windows, macOS on every push to `master` and every PR |
 
 ## Changes in detail
@@ -50,7 +50,7 @@ first match wins:
    `/opt/homebrew/bin`, `/usr/local/bin`, `/opt/local/bin` (MacPorts, new);
    `/usr/local/bin`, `/usr/bin`.
 
-### Process lifecycle — `dee81d9`, `d0cc051`
+### Process lifecycle — `dee81d9`, `d0cc051`, `2f10938`
 
 All launches go through one spawn function in `pm3/connection.rs`.
 
@@ -65,6 +65,11 @@ All launches go through one spawn function in `pm3/connection.rs`.
   early, so no process is left running that nothing can cancel.
 - A streaming client killed by a signal now counts as a failure; it used to
   be reported as success.
+- **No lost trailing output.** The shell plugin can report a fast-exiting
+  process as terminated before its last lines arrive. The streaming reader
+  used to stop at that point and drop them, so a caller could miss lines it
+  parses, such as flash "All done" or autopwn's dump file. It now keeps
+  reading until the pipes close, for at most 2 s.
 
 ### Device detection — `dee81d9`
 
@@ -169,9 +174,9 @@ calls.
 
 ### Tests — `dee81d9`, `af76184`, `64d33a9`, `9f500a7`
 
-- **Rust: 270** (225 upstream + 45 new), covering client lookup and path
-  validation, port validation and probe order, settings, diagnostics checks
-  and flash milestones.
+- **Rust: 272** (225 upstream + 47 new), covering client lookup and path
+  validation, port validation and probe order, settings, diagnostics checks,
+  flash milestones and stream event ordering.
 - **Fake-client process tests** (`connection.rs::process_tests`, Unix):
   run a fake `proxmark3` shell script through a mock Tauri app to check
   timeout kills, cancel, inactivity timeout, detection (including
@@ -218,10 +223,15 @@ calls.
 - **CI** on `master` at `d0cc051`
   ([run #2](https://github.com/Elmar2001/phosphor/actions/runs/37129858762)):
   passed on Linux (3.0 min), macOS (3.4 min) and Windows (4.5 min).
+- **Flaky test found and fixed:** the next run
+  ([run #3](https://github.com/Elmar2001/phosphor/actions/runs/37130517992))
+  failed on Linux in `flash_passes_port_positionally`. That exposed the
+  trailing-output race above, fixed in `2f10938`. Before the fix it failed
+  about 1 run in 20 under parallel load; after it, 300/300 runs passed.
 - **Locally (Linux):** `./scripts/check.sh` passes, and `cargo check`
   passes with no sidecar, DLL or firmware files present.
-- **Fixes proven by their tests:** the timeout-kill and cancelled-autopwn
-  tests were checked to fail with their fix reverted.
+- **Fixes proven by their tests:** the timeout-kill, cancelled-autopwn and
+  trailing-output tests were checked to fail with their fix reverted.
 - **Not yet tested:** real Proxmark3 hardware on any OS, and built
   Windows/macOS installers. `docs/releasing.md` has the hardware checklist.
 
