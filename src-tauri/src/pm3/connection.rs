@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -8,6 +9,7 @@ use tauri_plugin_shell::ShellExt;
 use tokio::time::{timeout, timeout_at, Instant};
 
 use crate::error::AppError;
+use crate::pm3::binary::{Pm3Binary, Pm3Source};
 use crate::pm3::output_parser::strip_ansi;
 use crate::pm3::{binary, ports};
 use crate::settings;
@@ -68,6 +70,14 @@ fn spawn_pm3<R: Runtime>(
     args: &[&str],
 ) -> Result<(tauri::async_runtime::Receiver<CommandEvent>, CommandChild), AppError> {
     let bin = binary::resolve(settings::custom_client_path(app).as_deref())?;
+    spawn_binary(app, &bin, args)
+}
+
+fn spawn_binary<R: Runtime>(
+    app: &AppHandle<R>,
+    bin: &Pm3Binary,
+    args: &[&str],
+) -> Result<(tauri::async_runtime::Receiver<CommandEvent>, CommandChild), AppError> {
     app.shell()
         .command(bin.path.as_os_str())
         .args(args)
@@ -193,6 +203,45 @@ pub async fn run_command<R: Runtime>(
         Err(e) => {
             emit_output(app, &e.to_string(), true);
             Err(e)
+        }
+    }
+}
+
+/// Result of launching the client with `--version`, for diagnostics.
+pub struct ClientProbe {
+    pub path: PathBuf,
+    pub source: Pm3Source,
+    pub exit_code: Option<i32>,
+    /// Cleaned stdout followed by stderr.
+    pub output: String,
+}
+
+pub enum ProbeError {
+    NotFound,
+    Spawn(String),
+    TimedOut(PathBuf),
+}
+
+const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Check that the resolved client actually starts (catches missing DLLs,
+/// wrong architecture, quarantine) without touching any serial port.
+pub async fn probe_client<R: Runtime>(app: &AppHandle<R>) -> Result<ClientProbe, ProbeError> {
+    let bin = binary::resolve(settings::custom_client_path(app).as_deref())
+        .map_err(|_| ProbeError::NotFound)?;
+    let (mut rx, child) =
+        spawn_binary(app, &bin, &["--version"]).map_err(|e| ProbeError::Spawn(e.to_string()))?;
+
+    match collect_output(&mut rx, Instant::now() + PROBE_TIMEOUT).await {
+        Ok(out) => Ok(ClientProbe {
+            path: bin.path,
+            source: bin.source,
+            exit_code: out.code,
+            output: strip_ansi(&format!("{}{}", out.stdout, out.stderr)),
+        }),
+        Err(_) => {
+            let _ = child.kill();
+            Err(ProbeError::TimedOut(bin.path))
         }
     }
 }
@@ -902,6 +951,15 @@ esac
         .unwrap();
         assert!(out.contains("All done"));
         assert!(slot.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn probe_reports_client_output() {
+        let f = fixture("probe", None);
+        let probe = probe_client(f.app.handle()).await.ok().unwrap();
+        assert_eq!(probe.source, Pm3Source::Custom);
+        assert_eq!(probe.exit_code, Some(1));
+        assert!(probe.output.contains("invalid serial port --version"));
     }
 
     #[tokio::test]

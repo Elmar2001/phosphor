@@ -277,3 +277,74 @@ export async function deleteSavedCard(id: number): Promise<void> {
 export async function runRawCommand(port: string, command: string): Promise<string> {
   return invoke<string>('run_raw_command', { port, command });
 }
+
+// -- PM3 runtime settings & diagnostics --
+
+export interface Pm3Settings {
+  /** Port probed first during detection; null = auto. */
+  preferredPort: string | null;
+  /** Absolute path to a proxmark3 client; null = auto lookup. */
+  clientPath: string | null;
+}
+
+export type CheckStatus = 'ok' | 'warning' | 'error';
+export type Pm3Source = 'custom' | 'bundled' | 'path' | 'knownLocation';
+
+export interface DiagnosticCheck {
+  id: string;
+  label: string;
+  status: CheckStatus;
+  detail: string;
+  hint: string | null;
+}
+
+export interface Pm3Candidate {
+  source: Pm3Source;
+  path: string;
+  exists: boolean;
+}
+
+export interface SerialPortEntry {
+  name: string;
+  kind: 'usb' | 'bluetooth' | 'pci' | 'unknown';
+  vid: number | null;
+  pid: number | null;
+  manufacturer: string | null;
+  product: string | null;
+  likelyPm3: boolean;
+}
+
+export interface Pm3Diagnostics {
+  appVersion: string;
+  platform: string;
+  overall: CheckStatus;
+  checks: DiagnosticCheck[];
+  client: { path: string; source: Pm3Source; version: string | null } | null;
+  clientCandidates: Pm3Candidate[];
+  ports: SerialPortEntry[];
+  firmware: { variant: string; available: boolean }[];
+  settings: Pm3Settings;
+}
+
+/** Read persisted PM3 runtime settings. */
+export async function getPm3Settings(): Promise<Pm3Settings> {
+  return invoke<Pm3Settings>('get_pm3_settings');
+}
+
+/**
+ * Validate and persist PM3 runtime settings. Rejects with a message for an
+ * invalid port or client path; returns the normalized settings on success.
+ */
+export async function setPm3Settings(settings: Pm3Settings): Promise<Pm3Settings> {
+  return invoke<Pm3Settings>('set_pm3_settings', { settings });
+}
+
+/** Serial ports currently present, with USB IDs when available. */
+export async function listSerialPorts(): Promise<SerialPortEntry[]> {
+  return invoke<SerialPortEntry[]>('list_serial_ports');
+}
+
+/** Check client, ports, firmware and overrides without touching the device. */
+export async function getPm3Diagnostics(): Promise<Pm3Diagnostics> {
+  return invoke<Pm3Diagnostics>('get_pm3_diagnostics');
+}

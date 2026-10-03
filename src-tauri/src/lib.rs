@@ -38,6 +38,8 @@ pub fn run() {
             commands::wizard::wizard_action,
             settings::get_pm3_settings,
             settings::set_pm3_settings,
+            commands::diagnostics::get_pm3_diagnostics,
+            commands::diagnostics::list_serial_ports,
             commands::device::detect_device,
             commands::blank::detect_blank,
             commands::scan::scan_card,

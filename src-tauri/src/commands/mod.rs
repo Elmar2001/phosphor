@@ -1,5 +1,6 @@
 pub mod blank;
 pub mod device;
+pub mod diagnostics;
 pub mod erase;
 pub mod firmware;
 pub mod hf_clone;

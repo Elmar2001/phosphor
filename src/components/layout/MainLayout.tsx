@@ -7,6 +7,7 @@ import { EraseView } from '../erase/EraseView';
 import { HistoryView } from '../history/HistoryView';
 import { SavedView } from '../saved/SavedView';
 import { SettingsView } from '../settings/SettingsView';
+import { DiagnosticsView } from '../diagnostics/DiagnosticsView';
 import { useMusic } from '../../hooks/useMusic';
 import { useWizard } from '../../hooks/useWizard';
 import { LiveTerminal } from '../shared/LiveTerminal';
@@ -58,6 +59,12 @@ export function MainLayout() {
         return (
           <div style={{ padding: '24px', position: 'relative', zIndex: 5 }}>
             <SavedView />
+          </div>
+        );
+      case 'diagnostics':
+        return (
+          <div style={{ padding: '24px', position: 'relative', zIndex: 5 }}>
+            <DiagnosticsView />
           </div>
         );
       case 'settings':
