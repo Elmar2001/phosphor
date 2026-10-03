@@ -1,0 +1,11 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "bundle": {
+    "targets": ["nsis"],
+    "externalBin": ["binaries/proxmark3"],
+    "resources": {
+      "pm3-libs/*": "./",
+      "pm3-libs/platforms/*": "./platforms/"
+    }
+  }
+}

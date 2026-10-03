@@ -24,8 +24,10 @@ dist-ssr
 *.sw?
 
 # Sidecar binaries + DLLs (GPL — download from Iceman fork releases)
-src-tauri/binaries/*.exe
+src-tauri/binaries/proxmark3*
 src-tauri/pm3-libs/
 
-# Firmware .elf files (download from proxmarkbuilds.org)
-src-tauri/firmware/
+# Firmware .elf files (download from proxmarkbuilds.org).
+# The directory itself stays so the "firmware" resource mapping always resolves.
+src-tauri/firmware/*
+!src-tauri/firmware/.gitkeep

@@ -27,14 +27,9 @@
   },
   "bundle": {
     "active": true,
-    "targets": ["nsis"],
-    "externalBin": ["binaries/proxmark3"],
+    "targets": "all",
     "resources": {
-      "pm3-libs/*": "./",
-      "pm3-libs/platforms/*": "./platforms/",
-      "firmware/rdv4/*": "./firmware/rdv4/",
-      "firmware/rdv4-bt/*": "./firmware/rdv4-bt/",
-      "firmware/generic/*": "./firmware/generic/"
+      "firmware": "firmware"
     },
     "icon": [
       "icons/32x32.png",
