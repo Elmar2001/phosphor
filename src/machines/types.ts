@@ -172,7 +172,7 @@ export interface FirmwareCheckResult {
 
 // Firmware flash progress event payload (emitted via Tauri events)
 export interface FirmwareProgress {
-  phase: 'connecting' | 'erasing' | 'writing' | 'done' | 'error';
+  phase: 'connecting' | 'bootloader' | 'erasing' | 'writing' | 'verifying' | 'done' | 'error';
   percent: number;
   message: string;
 }

@@ -30,6 +30,11 @@ function extractErrorMessage(e: unknown): string {
   return String(e);
 }
 
+// AppError::Cancelled serializes as the bare string "Cancelled".
+function isCancelledError(e: unknown): boolean {
+  return e === 'Cancelled';
+}
+
 // -- Machine context --
 
 export interface WizardContext {
@@ -632,16 +637,26 @@ export const wizardMachine = setup({
             }),
           },
         ],
-        onError: {
-          target: 'error',
-          actions: assign({
-            errorMessage: ({ event }) => stripSystemPaths(extractErrorMessage(event.error)),
-            errorUserMessage: () => 'HF key recovery or dump failed.',
-            errorRecoverable: () => true,
-            errorRecoveryAction: () => 'Retry' as RecoveryAction,
-            errorSource: () => 'scan' as const,
-          }),
-        },
+        onError: [
+          {
+            // cancel_hf_operation killed the client. The backend leaves the
+            // Rust FSM to CancelHfProcess, so mirror CANCEL_HF here instead of
+            // racing it into the error state.
+            guard: ({ event }) => isCancelledError(event.error),
+            target: 'deviceConnected',
+            actions: assign(() => clearCardFields),
+          },
+          {
+            target: 'error',
+            actions: assign({
+              errorMessage: ({ event }) => stripSystemPaths(extractErrorMessage(event.error)),
+              errorUserMessage: () => 'HF key recovery or dump failed.',
+              errorRecoverable: () => true,
+              errorRecoveryAction: () => 'Retry' as RecoveryAction,
+              errorSource: () => 'scan' as const,
+            }),
+          },
+        ],
       },
       on: {
         HF_PROGRESS: {
