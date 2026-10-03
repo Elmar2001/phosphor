@@ -1,15 +1,16 @@
-use std::sync::{LazyLock, Mutex};
+use std::sync::Mutex;
 use std::time::Duration;
 
-use regex::Regex;
 use serde::Serialize;
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Runtime};
 use tauri_plugin_shell::process::{CommandChild, CommandEvent};
 use tauri_plugin_shell::ShellExt;
-use tokio::time::timeout;
+use tokio::time::{timeout, timeout_at, Instant};
 
 use crate::error::AppError;
 use crate::pm3::output_parser::strip_ansi;
+use crate::pm3::{binary, ports};
+use crate::settings;
 
 /// Payload emitted as `pm3-output` events for the live terminal panel.
 #[derive(Debug, Clone, Serialize)]
@@ -20,7 +21,7 @@ pub struct Pm3OutputPayload {
 }
 
 /// Emit raw PM3 output to the frontend terminal panel.
-pub fn emit_output(app: &AppHandle, text: &str, is_error: bool) {
+pub fn emit_output<R: Runtime>(app: &AppHandle<R>, text: &str, is_error: bool) {
     for line in text.lines() {
         let trimmed = line.trim();
         if trimmed.is_empty() {
@@ -39,164 +40,150 @@ pub fn emit_output(app: &AppHandle, text: &str, is_error: bool) {
 /// Maximum time to wait for a PM3 subprocess to complete (30 seconds).
 const PM3_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Returns the ordered list of Tauri shell scope names to try when spawning the
-/// PM3 binary. The first entry (`"proxmark3"`) resolves via PATH; subsequent
-/// entries are platform-specific absolute paths registered in the shell scope.
-/// This lets users who installed PM3 outside of PATH (common on Windows) still
-/// use the app without manually editing their system PATH.
-fn pm3_scope_names() -> Vec<&'static str> {
-    let mut names = vec!["proxmark3"];
+/// Inactivity limit for a firmware flash. The client itself waits up to 20 s
+/// (`-w`) for the bootloader port to reappear between phases.
+const PM3_FLASH_TIMEOUT: Duration = Duration::from_secs(300);
 
-    if cfg!(target_os = "windows") {
-        names.push("proxmark3-win-c");
-        names.push("proxmark3-win-progfiles");
-    } else if cfg!(target_os = "macos") {
-        names.push("proxmark3-mac-local");
-        names.push("proxmark3-mac-brew");
-    } else {
-        // Linux and other unix-like
-        names.push("proxmark3-linux-local");
-        names.push("proxmark3-linux-usr");
+/// Reject invocations that could smuggle extra PM3 commands or flags.
+/// The PM3 CLI's `-c` flag treats `;` as a delimiter, so a crafted value
+/// like "AA;lf t55xx wipe" would execute two commands. Block this at the
+/// chokepoint so no caller can accidentally pass through unsanitised input.
+fn validate_invocation(port: &str, cmd: &str) -> Result<(), AppError> {
+    if !ports::is_valid_port(port) {
+        return Err(AppError::CommandFailed(format!("Invalid port: {}", port)));
     }
-
-    names
-}
-
-/// Validates that a port string matches expected serial port patterns.
-/// Accepts COM1-COM256+ (Windows), /dev/ttyACM0-99, /dev/ttyUSB0-99 (Linux),
-/// and /dev/tty.usbmodem* (macOS).
-static PORT_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^(COM[1-9]\d*|/dev/tty(ACM|USB)\d{1,2}|/dev/tty\.usbmodem\w+)$")
-        .expect("bad port regex")
-});
-
-/// Internal PM3 execution that does NOT emit to the frontend.
-/// Handles: port validation, command sanitization, sidecar fallback, PATH lookup,
-/// process spawn, output collection, ANSI stripping, and timeout.
-/// Returns the cleaned output string on success.
-async fn execute_pm3(app: &AppHandle, port: &str, cmd: &str) -> Result<String, AppError> {
-    // Validate port format to prevent command injection via subprocess args
-    if !PORT_RE.is_match(port) {
-        return Err(AppError::CommandFailed(format!(
-            "Invalid port: {}",
-            port
-        )));
-    }
-
-    // Reject command strings containing PM3 command separators or newlines.
-    // The PM3 CLI's `-c` flag treats `;` as a delimiter, so a crafted value
-    // like "AA;lf t55xx wipe" would execute two commands. Block this at the
-    // chokepoint so no caller can accidentally pass through unsanitised input.
     if cmd.contains(';') || cmd.contains('\n') || cmd.contains('\r') {
         return Err(AppError::CommandFailed(
             "Invalid characters in command".into(),
         ));
     }
-    if port.contains(';') || port.contains('\n') || port.contains('\r') {
-        return Err(AppError::CommandFailed(
-            "Invalid characters in command".into(),
-        ));
+    Ok(())
+}
+
+/// The only place the PM3 client is launched. Resolves the binary to an
+/// absolute path (custom setting, bundled sidecar, PATH, known locations)
+/// and spawns it with `args`.
+fn spawn_pm3<R: Runtime>(
+    app: &AppHandle<R>,
+    args: &[&str],
+) -> Result<(tauri::async_runtime::Receiver<CommandEvent>, CommandChild), AppError> {
+    let bin = binary::resolve(settings::custom_client_path(app).as_deref())?;
+    app.shell()
+        .command(bin.path.as_os_str())
+        .args(args)
+        .spawn()
+        .map_err(|e| {
+            AppError::CommandFailed(format!(
+                "Failed to spawn proxmark3 ({}): {}",
+                bin.path.display(),
+                e
+            ))
+        })
+}
+
+/// Output of a finished PM3 process, accumulated the same way the shell
+/// plugin's `Command::output()` does.
+#[derive(Debug, Default)]
+struct CollectedOutput {
+    code: Option<i32>,
+    stdout: String,
+    stderr: String,
+}
+
+/// Drain a PM3 process's events until it terminates or `deadline` passes.
+async fn collect_output(
+    rx: &mut tauri::async_runtime::Receiver<CommandEvent>,
+    deadline: Instant,
+) -> Result<CollectedOutput, tokio::time::error::Elapsed> {
+    let mut out = CollectedOutput::default();
+    while let Some(event) = timeout_at(deadline, rx.recv()).await? {
+        match event {
+            CommandEvent::Stdout(bytes) => {
+                out.stdout.push_str(&String::from_utf8_lossy(&bytes));
+                out.stdout.push('\n');
+            }
+            CommandEvent::Stderr(bytes) => {
+                out.stderr.push_str(&String::from_utf8_lossy(&bytes));
+                out.stderr.push('\n');
+            }
+            CommandEvent::Terminated(payload) => out.code = payload.code,
+            CommandEvent::Error(_) => {}
+            _ => {} // Future CommandEvent variants
+        }
     }
+    Ok(out)
+}
 
-    // 1) Try bundled sidecar binary first (available in production builds).
-    //    In dev mode the sidecar won't exist, so this silently falls through.
-    match try_sidecar_silent(app, port, cmd).await {
-        Ok(output) => return Ok(output),
-        Err(_) => { /* sidecar not available -- fall through to PATH/scope lookup */ }
+/// Map a finished one-shot PM3 run to cleaned stdout or an error.
+/// PM3 exits with -5 (251 as an unsigned exit status) on its own timeouts.
+fn interpret_output(cmd: &str, out: CollectedOutput) -> Result<String, AppError> {
+    let code = out.code.unwrap_or(-1);
+    match code {
+        0 => Ok(strip_ansi(&out.stdout)),
+        -5 | 251 => Err(AppError::Timeout(format!("PM3 timed out running: {}", cmd))),
+        _ => {
+            let detail = if out.stderr.trim().is_empty() {
+                strip_ansi(&out.stdout)
+            } else {
+                strip_ansi(&out.stderr)
+            };
+            Err(AppError::CommandFailed(format!(
+                "Exit code {}: {}",
+                code, detail
+            )))
+        }
     }
+}
 
-    // 2) Fall back to PATH-based lookup, then common install locations.
-    // Each scope name maps to a binary path registered in capabilities/default.json.
-    let scope_names = pm3_scope_names();
-    let mut first_spawn_error: Option<AppError> = None;
+/// Internal PM3 execution that does NOT emit to the frontend.
+/// Handles: invocation validation, binary lookup, process spawn, output
+/// collection, ANSI stripping, and timeout. A process that outlives the
+/// timeout is killed so it can't keep the serial port open.
+async fn execute_pm3<R: Runtime>(
+    app: &AppHandle<R>,
+    port: &str,
+    cmd: &str,
+) -> Result<String, AppError> {
+    execute_pm3_with_timeout(app, port, cmd, PM3_COMMAND_TIMEOUT).await
+}
 
-    for scope_name in &scope_names {
-        let output_future = app
-            .shell()
-            .command(scope_name)
-            .args(["-p", port, "-f", "-c", cmd])
-            .output();
+async fn execute_pm3_with_timeout<R: Runtime>(
+    app: &AppHandle<R>,
+    port: &str,
+    cmd: &str,
+    limit: Duration,
+) -> Result<String, AppError> {
+    validate_invocation(port, cmd)?;
 
-        // Note: When the timeout fires and the future is dropped, Tauri's shell plugin
-        // handles cleanup of the child process. The `tokio::time::timeout` wrapper
-        // ensures we don't wait forever, and the Tauri runtime drops the child on cancel.
-        let output = match timeout(PM3_COMMAND_TIMEOUT, output_future).await {
-            Err(_) => {
-                return Err(AppError::Timeout(format!(
-                    "PM3 command timed out after {}s: {}",
-                    PM3_COMMAND_TIMEOUT.as_secs(),
-                    cmd
-                )));
-            }
-            Ok(Err(e)) => {
-                // Spawn failed -- binary not found at this path. Record the error
-                // from the first attempt (PATH lookup) and try the next location.
-                if first_spawn_error.is_none() {
-                    first_spawn_error = Some(AppError::CommandFailed(format!(
-                        "Failed to spawn proxmark3: {}",
-                        e
-                    )));
-                }
-                continue;
-            }
-            Ok(Ok(output)) => output,
-        };
+    let (mut rx, child) = spawn_pm3(app, &["-p", port, "-f", "-c", cmd])?;
 
-        // Binary was found and executed -- process the result immediately.
-        // No further fallback attempts needed regardless of exit code.
-        let code = output.status.code().unwrap_or(-1);
-        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-
-        return match code {
-            0 => {
-                let cleaned = strip_ansi(&stdout);
-                Ok(cleaned)
-            }
-            -5 | 251 => Err(AppError::Timeout(format!(
-                "PM3 timed out running: {}",
+    match collect_output(&mut rx, Instant::now() + limit).await {
+        Ok(out) => interpret_output(cmd, out),
+        Err(_) => {
+            let _ = child.kill();
+            Err(AppError::Timeout(format!(
+                "PM3 command timed out after {}s: {}",
+                limit.as_secs(),
                 cmd
-            ))),
-            _ => {
-                let detail = if stderr.is_empty() {
-                    strip_ansi(&stdout)
-                } else {
-                    strip_ansi(&stderr)
-                };
-                Err(AppError::CommandFailed(format!(
-                    "Exit code {}: {}",
-                    code, detail
-                )))
-            }
-        };
+            )))
+        }
     }
-
-    // All scope names exhausted -- return the first spawn error (from PATH lookup)
-    // so the error message is the most user-recognizable one.
-    Err(first_spawn_error.unwrap_or_else(|| {
-        AppError::CommandFailed("Failed to spawn proxmark3: binary not found".into())
-    }))
 }
 
 /// Run a single PM3 command: spawns `proxmark3 -p {port} -f -c "{cmd}"`,
 /// waits for the process to exit (with a 30-second timeout), then returns cleaned stdout.
-/// If the subprocess hangs (e.g., USB cable pulled), it will be killed after the timeout.
+/// If the subprocess hangs (e.g., USB cable pulled), it is killed after the timeout.
 ///
 /// Emits the command being run and its output to the frontend terminal panel.
 ///
-/// **Known limitation -- subprocess cancellation on reset:**
-/// This function uses `tauri_plugin_shell`'s `.output()` which internally spawns a child
-/// process and collects stdout/stderr until exit. Because the child handle is owned by the
-/// shell plugin's future and not exposed to callers, we cannot kill the subprocess from
-/// outside (e.g., when the user presses Reset during a write operation). Refactoring to
-/// `spawn()` + async stream reading would be needed for true cancellation support.
-///
-/// In practice this is acceptable because:
-/// - T5577/EM4305 LF writes complete in under 2 seconds.
-/// - The 30-second timeout (`PM3_COMMAND_TIMEOUT`) already protects against hangs.
-/// - When the Tauri future is dropped (timeout or app shutdown), the shell plugin
-///   cleans up the child process.
-pub async fn run_command(app: &AppHandle, port: &str, cmd: &str) -> Result<String, AppError> {
+/// Not externally cancellable: the child handle isn't exposed. That's fine for
+/// the short commands routed here (LF writes finish in under 2 seconds); use
+/// `run_command_streaming()` for anything long-running.
+pub async fn run_command<R: Runtime>(
+    app: &AppHandle<R>,
+    port: &str,
+    cmd: &str,
+) -> Result<String, AppError> {
     emit_output(app, &format!("pm3 --> {}", cmd), false);
     match execute_pm3(app, port, cmd).await {
         Ok(output) => {
@@ -233,131 +220,136 @@ impl HfOperationState {
 }
 
 // ---------------------------------------------------------------------------
-// Streaming command execution (HF operations)
+// Streaming command execution (HF operations, firmware flash)
 // ---------------------------------------------------------------------------
 
 /// Run a PM3 command with streaming output, supporting long timeouts and
-/// cancellation. Unlike `run_command()` which uses `.output()` (blocks until
-/// exit), this uses `.spawn()` + async line reading.
+/// cancellation. Unlike `run_command()` which waits for exit, this streams
+/// lines as they arrive.
 ///
 /// - Each stdout/stderr line is emitted as a `pm3-output` event (live terminal).
 /// - A per-line callback `on_line` is invoked for real-time parsing (e.g. autopwn
 ///   progress events). The callback receives the cleaned line text.
 /// - The child process is stored in `hf_state.child` so `cancel_hf_operation`
-///   can kill it mid-run.
+///   can kill it mid-run; a cancelled run returns `AppError::Cancelled`.
+/// - `timeout_secs` is an inactivity limit; the process is killed when it fires.
 /// - Returns the accumulated cleaned output on success.
-pub async fn run_command_streaming<F>(
-    app: &AppHandle,
+pub async fn run_command_streaming<R: Runtime, F>(
+    app: &AppHandle<R>,
     port: &str,
     cmd: &str,
     timeout_secs: u64,
     hf_state: &HfOperationState,
+    on_line: F,
+) -> Result<String, AppError>
+where
+    F: FnMut(&str),
+{
+    validate_invocation(port, cmd)?;
+    emit_output(app, &format!("pm3 --> {}", cmd), false);
+    run_streaming(
+        app,
+        &["-p", port, "-f", "-c", cmd],
+        Duration::from_secs(timeout_secs),
+        &hf_state.child,
+        on_line,
+    )
+    .await
+}
+
+/// Flash `image` to the PM3 on `port` (`proxmark3 <port> --flash --image <image> -w`).
+/// Streams output like `run_command_streaming()`; the child is parked in
+/// `child_slot` so `cancel_flash` can kill it.
+pub async fn run_flash<R: Runtime, F>(
+    app: &AppHandle<R>,
+    port: &str,
+    image: &str,
+    child_slot: &Mutex<Option<CommandChild>>,
+    on_line: F,
+) -> Result<String, AppError>
+where
+    F: FnMut(&str),
+{
+    validate_invocation(port, "")?;
+    emit_output(app, "pm3 --> --flash --image fullimage.elf", false);
+    run_streaming(
+        app,
+        &[port, "--flash", "--image", image, "-w"],
+        PM3_FLASH_TIMEOUT,
+        child_slot,
+        on_line,
+    )
+    .await
+}
+
+/// Spawn PM3 with `args`, park the child in `child_slot`, and stream its
+/// output. If the slot is empty once the stream ends, a cancel command took
+/// and killed the child: report `AppError::Cancelled` so callers can leave the
+/// wizard state to the cancel path instead of racing it with an error.
+async fn run_streaming<R: Runtime, F>(
+    app: &AppHandle<R>,
+    args: &[&str],
+    inactivity_timeout: Duration,
+    child_slot: &Mutex<Option<CommandChild>>,
     mut on_line: F,
 ) -> Result<String, AppError>
 where
     F: FnMut(&str),
 {
-    // Validate port
-    if !PORT_RE.is_match(port) {
-        return Err(AppError::CommandFailed(format!("Invalid port: {}", port)));
-    }
+    let (rx, child) = match spawn_pm3(app, args) {
+        Ok(spawned) => spawned,
+        Err(e) => {
+            emit_output(app, &e.to_string(), true);
+            return Err(e);
+        }
+    };
 
-    // Reject command separators
-    if cmd.contains(';') || cmd.contains('\n') || cmd.contains('\r') {
-        return Err(AppError::CommandFailed(
-            "Invalid characters in command".into(),
-        ));
-    }
-
-    emit_output(app, &format!("pm3 --> {}", cmd), false);
-
-    // Try sidecar first, then scope names — same strategy as execute_pm3()
-    let (rx, child) = spawn_pm3(app, port, cmd)?;
-
-    // Store child for cancellation
     {
-        let mut lock = hf_state.child.lock().map_err(|e| {
-            AppError::CommandFailed(format!("HF state lock poisoned: {}", e))
-        })?;
+        let mut lock = child_slot
+            .lock()
+            .map_err(|e| AppError::CommandFailed(format!("Process state lock poisoned: {}", e)))?;
         *lock = Some(child);
     }
 
-    // Read lines with timeout
-    let result = read_stream_with_timeout(app, rx, timeout_secs, &mut on_line).await;
+    let result = read_stream_with_timeout(app, rx, inactivity_timeout, &mut on_line).await;
 
-    // Clear child on completion (process already exited or was killed)
-    {
-        let mut lock = hf_state.child.lock().unwrap_or_else(|e| e.into_inner());
-        *lock = None;
-    }
+    let child = child_slot.lock().unwrap_or_else(|e| e.into_inner()).take();
+    let Some(child) = child else {
+        emit_output(app, "[=] Operation cancelled", false);
+        return Err(AppError::Cancelled);
+    };
 
     match result {
         Ok(output) => Ok(output),
         Err(e) => {
+            // Timeout or pipe error while the client may still be running.
+            let _ = child.kill();
             emit_output(app, &e.to_string(), true);
             Err(e)
         }
     }
 }
 
-/// Spawn PM3 via sidecar or scope names, returning the event receiver + child.
-fn spawn_pm3(
-    app: &AppHandle,
-    port: &str,
-    cmd: &str,
-) -> Result<(tauri::async_runtime::Receiver<CommandEvent>, CommandChild), AppError> {
-    let args = ["-p", port, "-f", "-c", cmd];
-
-    // Try sidecar first
-    if let Ok(sidecar_cmd) = app.shell().sidecar("binaries/proxmark3") {
-        if let Ok(result) = sidecar_cmd.args(&args).spawn() {
-            return Ok(result);
-        }
-    }
-
-    // Fall back to scope names
-    let scope_names = pm3_scope_names();
-    let mut first_err: Option<String> = None;
-
-    for scope_name in &scope_names {
-        match app.shell().command(scope_name).args(&args).spawn() {
-            Ok(result) => return Ok(result),
-            Err(e) => {
-                if first_err.is_none() {
-                    first_err = Some(format!("{}", e));
-                }
-            }
-        }
-    }
-
-    Err(AppError::CommandFailed(format!(
-        "Failed to spawn proxmark3: {}",
-        first_err.unwrap_or_else(|| "binary not found".into())
-    )))
-}
-
 /// Read from a `CommandEvent` receiver, accumulating output and emitting lines.
 /// Returns the full cleaned output when the process terminates.
-async fn read_stream_with_timeout<F>(
-    app: &AppHandle,
+async fn read_stream_with_timeout<R: Runtime, F>(
+    app: &AppHandle<R>,
     mut rx: tauri::async_runtime::Receiver<CommandEvent>,
-    timeout_secs: u64,
+    inactivity_timeout: Duration,
     on_line: &mut F,
 ) -> Result<String, AppError>
 where
     F: FnMut(&str),
 {
-    let deadline = Duration::from_secs(timeout_secs);
     let mut accumulated = String::new();
     let mut exit_code: Option<i32> = None;
 
     loop {
-        match timeout(deadline, rx.recv()).await {
+        match timeout(inactivity_timeout, rx.recv()).await {
             Err(_) => {
-                // Timeout expired
                 return Err(AppError::Timeout(format!(
-                    "HF operation timed out after {}s",
-                    timeout_secs
+                    "PM3 produced no output for {}s",
+                    inactivity_timeout.as_secs()
                 )));
             }
             Ok(None) => {
@@ -366,33 +358,14 @@ where
             }
             Ok(Some(event)) => match event {
                 CommandEvent::Stdout(bytes) => {
-                    let line = String::from_utf8_lossy(&bytes);
-                    let cleaned = strip_ansi(&line);
-                    let trimmed = cleaned.trim();
-                    if !trimmed.is_empty() {
-                        emit_output(app, trimmed, false);
-                        on_line(trimmed);
-                        accumulated.push_str(trimmed);
-                        accumulated.push('\n');
-                    }
+                    handle_stream_line(app, &bytes, false, on_line, &mut accumulated);
                 }
                 CommandEvent::Stderr(bytes) => {
-                    let line = String::from_utf8_lossy(&bytes);
-                    let cleaned = strip_ansi(&line);
-                    let trimmed = cleaned.trim();
-                    if !trimmed.is_empty() {
-                        emit_output(app, trimmed, true);
-                        on_line(trimmed);
-                        accumulated.push_str(trimmed);
-                        accumulated.push('\n');
-                    }
+                    handle_stream_line(app, &bytes, true, on_line, &mut accumulated);
                 }
                 CommandEvent::Error(msg) => {
                     emit_output(app, &msg, true);
-                    return Err(AppError::CommandFailed(format!(
-                        "Process error: {}",
-                        msg
-                    )));
+                    return Err(AppError::CommandFailed(format!("Process error: {}", msg)));
                 }
                 CommandEvent::Terminated(payload) => {
                     exit_code = payload.code;
@@ -403,25 +376,51 @@ where
         }
     }
 
-    // Check exit code
     match exit_code {
-        Some(0) | None => Ok(accumulated),
+        Some(0) => Ok(accumulated),
         Some(-5) | Some(251) => Err(AppError::Timeout("PM3 subprocess timed out".into())),
         Some(code) => Err(AppError::CommandFailed(format!(
             "PM3 exited with code {}",
             code
         ))),
+        None => Err(AppError::CommandFailed(
+            "PM3 was terminated by a signal".into(),
+        )),
     }
 }
 
-/// Scan common COM/serial ports trying `hw version` to find a connected PM3.
+fn handle_stream_line<R: Runtime, F>(
+    app: &AppHandle<R>,
+    bytes: &[u8],
+    is_error: bool,
+    on_line: &mut F,
+    accumulated: &mut String,
+) where
+    F: FnMut(&str),
+{
+    let line = String::from_utf8_lossy(bytes);
+    let cleaned = strip_ansi(&line);
+    let trimmed = cleaned.trim();
+    if !trimmed.is_empty() {
+        emit_output(app, trimmed, is_error);
+        on_line(trimmed);
+        accumulated.push_str(trimmed);
+        accumulated.push('\n');
+    }
+}
+
+/// Probe serial ports with `hw version` to find a connected PM3.
 /// Returns (port, model, firmware) on success.
+///
+/// Probe order comes from `ports::detection_order()`: the preferred port from
+/// Settings, enumerated ports that look like a PM3 (USB VID/PID), other USB
+/// serial ports, then the legacy fixed guesses.
 ///
 /// Uses friendly, hacker-casual terminal output. All probe messages are green
 /// (non-error) except the final "not found" message.
-pub async fn detect_device(app: &AppHandle) -> Result<(String, String, String), AppError> {
-    let candidates = build_port_candidates();
-
+pub async fn detect_device<R: Runtime>(
+    app: &AppHandle<R>,
+) -> Result<(String, String, String), AppError> {
     // Pick a random init message for personality
     let init_msgs = [
         "[=] Sniffing USB bus... come out, Proxmark",
@@ -437,13 +436,52 @@ pub async fn detect_device(app: &AppHandle) -> Result<(String, String, String), 
         % init_msgs.len();
     emit_output(app, init_msgs[idx], false);
 
+    // Resolve the client up front: without it no port can be probed.
+    match binary::resolve(settings::custom_client_path(app).as_deref()) {
+        Ok(bin) => emit_output(
+            app,
+            &format!("[=] PM3 client: {}", bin.path.display()),
+            false,
+        ),
+        Err(e) => {
+            emit_output(
+                app,
+                "[!!] Proxmark3 client not found. Check installation.",
+                true,
+            );
+            emit_platform_install_hints(app);
+            return Err(e);
+        }
+    }
+
+    let enumerated = ports::list_ports();
+    if let Ok(found) = &enumerated {
+        for port in found.iter().filter(|p| p.likely_pm3) {
+            emit_output(
+                app,
+                &format!("[+] Proxmark3 USB device on {}", port.name),
+                false,
+            );
+        }
+    }
+    let preferred = settings::current(app).preferred_port;
+    let candidates = ports::detection_order(
+        preferred.as_deref(),
+        &enumerated,
+        &ports::fallback_candidates(),
+    );
+
     for port in &candidates {
         emit_output(app, &format!("[=] Knocking on {}...", port), false);
 
         match execute_pm3(app, port, "hw version").await {
             Ok(output) => {
                 if let Some((model, firmware)) = parse_hw_version(&output) {
-                    emit_output(app, &format!("[+] Target acquired: {} on {}", model, port), false);
+                    emit_output(
+                        app,
+                        &format!("[+] Target acquired: {} on {}", model, port),
+                        false,
+                    );
                     emit_output(app, &format!("[+] Firmware: {}", firmware), false);
                     return Ok((port.clone(), model, firmware));
                 }
@@ -457,7 +495,14 @@ pub async fn detect_device(app: &AppHandle) -> Result<(String, String, String), 
                 // handle the mismatch and offer to flash.
                 let err_msg = e.to_string();
                 if err_msg.to_lowercase().contains("capabilities") {
-                    emit_output(app, &format!("[+] Target acquired: Proxmark3 on {} (firmware mismatch)", port), false);
+                    emit_output(
+                        app,
+                        &format!(
+                            "[+] Target acquired: Proxmark3 on {} (firmware mismatch)",
+                            port
+                        ),
+                        false,
+                    );
                     return Ok((
                         port.clone(),
                         "Proxmark3".to_string(),
@@ -469,7 +514,11 @@ pub async fn detect_device(app: &AppHandle) -> Result<(String, String, String), 
                 // from other errors. If spawn itself failed (binary not found), that
                 // affects ALL ports, so propagate immediately.
                 if err_msg.contains("Failed to spawn proxmark3") {
-                    emit_output(app, "[!!] Proxmark3 binary not found. Check installation.", true);
+                    emit_output(
+                        app,
+                        "[!!] Proxmark3 binary could not be started. Check installation.",
+                        true,
+                    );
                     return Err(e);
                 }
 
@@ -479,104 +528,43 @@ pub async fn detect_device(app: &AppHandle) -> Result<(String, String, String), 
     }
 
     emit_output(app, "[!!] No Proxmark3 found.", true);
-    emit_output(app, "[=] Try a different USB cable (some are charge-only)", false);
-    emit_output(app, "[=] Check Device Manager for a COM port", false);
-    emit_output(app, "[=] PM3 Easy: may need CH340 driver (wch-ic.com)", false);
+    emit_output(
+        app,
+        "[=] Try a different USB cable (some are charge-only)",
+        false,
+    );
+    emit_platform_detect_hints(app);
     Err(AppError::DeviceNotFound)
 }
 
-fn build_port_candidates() -> Vec<String> {
-    let mut ports = Vec::new();
-
-    if cfg!(target_os = "windows") {
-        // Windows COM ports -- extend to 40 to cover USB hub reassignment
-        for i in 1..=40 {
-            ports.push(format!("COM{}", i));
-        }
+fn emit_platform_detect_hints<R: Runtime>(app: &AppHandle<R>) {
+    let hints: &[&str] = if cfg!(target_os = "windows") {
+        &[
+            "[=] Check Device Manager for a COM port",
+            "[=] PM3 Easy: may need CH340 driver (wch-ic.com)",
+        ]
     } else if cfg!(target_os = "macos") {
-        // macOS: /dev/tty.usbmodem* -- cover common PM3 suffixes
-        for suffix in &[
-            "iceman1",
-            "14101",
-            "14201",
-            "14301",
-            "1",
-            "2",
-            "3",
-        ] {
-            ports.push(format!("/dev/tty.usbmodem{}", suffix));
-        }
+        &["[=] Check System Information > USB, and ls /dev/tty.usbmodem*"]
     } else {
-        // Linux: /dev/ttyACM* and /dev/ttyUSB*
-        for i in 0..=5 {
-            ports.push(format!("/dev/ttyACM{}", i));
-            ports.push(format!("/dev/ttyUSB{}", i));
-        }
+        &[
+            "[=] Check ls /dev/ttyACM* and that your user is in the dialout group",
+            "[=] ModemManager can grab the port: stop it or add a udev rule",
+        ]
+    };
+    for hint in hints {
+        emit_output(app, hint, false);
     }
-
-    ports
 }
 
-/// Attempt to run a PM3 command via the bundled sidecar binary (silent -- no emit).
-/// Returns Ok(stdout) on success, Err on any failure (sidecar not found, spawn
-/// error, non-zero exit code). Callers should fall through to PATH-based lookup
-/// on failure.
-///
-/// The sidecar binary depends on DLLs (Qt5, ICU, etc.) bundled in the same
-/// directory via `bundle.resources`. The Windows DLL loader finds them
-/// automatically since they share the sidecar's directory.
-async fn try_sidecar_silent(app: &AppHandle, port: &str, cmd: &str) -> Result<String, AppError> {
-    let sidecar = app
-        .shell()
-        .sidecar("binaries/proxmark3")
-        .map_err(|e| AppError::CommandFailed(format!("Sidecar not available: {}", e)))?;
-
-    let output_future = sidecar
-        .args(["-p", port, "-f", "-c", cmd])
-        .output();
-
-    let output = match timeout(PM3_COMMAND_TIMEOUT, output_future).await {
-        Err(_) => {
-            return Err(AppError::Timeout(format!(
-                "PM3 command timed out after {}s: {}",
-                PM3_COMMAND_TIMEOUT.as_secs(),
-                cmd
-            )));
-        }
-        Ok(Err(e)) => {
-            return Err(AppError::CommandFailed(format!(
-                "Failed to run sidecar: {}",
-                e
-            )));
-        }
-        Ok(Ok(output)) => output,
+fn emit_platform_install_hints<R: Runtime>(app: &AppHandle<R>) {
+    let hint = if cfg!(target_os = "windows") {
+        "[=] Reinstall Phosphor, or check antivirus quarantine for proxmark3.exe"
+    } else if cfg!(target_os = "macos") {
+        "[=] brew install rfidresearchgroup/proxmark3/proxmark3, or set the path in Settings"
+    } else {
+        "[=] Install the Iceman proxmark3 client, or set its path in Settings"
     };
-
-    let code = output.status.code().unwrap_or(-1);
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-
-    match code {
-        0 => {
-            let cleaned = strip_ansi(&stdout);
-            Ok(cleaned)
-        }
-        -5 | 251 => Err(AppError::Timeout(format!(
-            "PM3 timed out running: {}",
-            cmd
-        ))),
-        _ => {
-            let detail = if stderr.is_empty() {
-                strip_ansi(&stdout)
-            } else {
-                strip_ansi(&stderr)
-            };
-            Err(AppError::CommandFailed(format!(
-                "Exit code {}: {}",
-                code, detail
-            )))
-        }
-    }
+    emit_output(app, hint, false);
 }
 
 fn parse_hw_version(output: &str) -> Option<(String, String)> {
@@ -608,9 +596,9 @@ fn extract_short_version(version_str: &str) -> String {
     // Find 'v' followed by a digit
     let v_pos = version_str.char_indices().find(|&(i, c)| {
         c == 'v'
-            && version_str
-                .get(i + 1..i + 2)
-                .map_or(false, |s| s.as_bytes().first().map_or(false, |b| b.is_ascii_digit()))
+            && version_str.get(i + 1..i + 2).map_or(false, |s| {
+                s.as_bytes().first().map_or(false, |b| b.is_ascii_digit())
+            })
     });
 
     if let Some((pos, _)) = v_pos {
@@ -622,5 +610,307 @@ fn extract_short_version(version_str: &str) -> String {
         rest[..end].to_string()
     } else {
         version_str.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tauri_plugin_shell::process::TerminatedPayload;
+
+    fn finished(code: Option<i32>, stdout: &str, stderr: &str) -> CollectedOutput {
+        CollectedOutput {
+            code,
+            stdout: stdout.to_string(),
+            stderr: stderr.to_string(),
+        }
+    }
+
+    #[test]
+    fn invocation_rejects_separators_and_bad_ports() {
+        assert!(validate_invocation("COM3", "hw version").is_ok());
+        assert!(validate_invocation("COM3", "lf search;lf t55xx wipe").is_err());
+        assert!(validate_invocation("COM3", "hw version\nhw reset").is_err());
+        assert!(validate_invocation("COM3", "hw version\rhw reset").is_err());
+        assert!(validate_invocation("--flash", "hw version").is_err());
+        assert!(validate_invocation("COM3;hw reset", "hw version").is_err());
+    }
+
+    #[test]
+    fn exit_zero_returns_clean_stdout() {
+        let out = interpret_output("hw version", finished(Some(0), "\x1b[32mOK\x1b[0m\n", ""));
+        assert_eq!(out.unwrap().trim(), "OK");
+    }
+
+    #[test]
+    fn pm3_timeout_codes_map_to_timeout() {
+        for code in [-5, 251] {
+            let err = interpret_output("lf search", finished(Some(code), "", "")).unwrap_err();
+            assert!(matches!(err, AppError::Timeout(_)));
+        }
+    }
+
+    #[test]
+    fn failure_prefers_stderr_and_keeps_capabilities_text() {
+        let err = interpret_output(
+            "hw version",
+            finished(Some(1), "banner", "[!!] capabilities mismatch\n"),
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("Exit code 1"));
+        assert!(msg.contains("capabilities"));
+        assert!(!msg.contains("banner"));
+    }
+
+    #[test]
+    fn failure_falls_back_to_stdout_and_signal_maps_to_minus_one() {
+        let err = interpret_output("hw version", finished(None, "no device", "  \n")).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "PM3 command failed: Exit code -1: no device"
+        );
+    }
+
+    #[tokio::test]
+    async fn collect_output_gathers_streams_until_termination() {
+        let (tx, mut rx) = tauri::async_runtime::channel(8);
+        tx.send(CommandEvent::Stdout(b"line 1\n".to_vec()))
+            .await
+            .unwrap();
+        tx.send(CommandEvent::Stderr(b"warn\n".to_vec()))
+            .await
+            .unwrap();
+        tx.send(CommandEvent::Stdout(b"line 2\n".to_vec()))
+            .await
+            .unwrap();
+        tx.send(CommandEvent::Terminated(TerminatedPayload {
+            code: Some(0),
+            signal: None,
+        }))
+        .await
+        .unwrap();
+        drop(tx);
+
+        let out = collect_output(&mut rx, Instant::now() + Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(out.code, Some(0));
+        assert!(out.stdout.contains("line 1") && out.stdout.contains("line 2"));
+        assert!(out.stderr.contains("warn"));
+    }
+
+    #[tokio::test]
+    async fn collect_output_times_out_on_silent_process() {
+        let (_tx, mut rx) = tauri::async_runtime::channel::<CommandEvent>(1);
+        let result = collect_output(&mut rx, Instant::now() + Duration::from_millis(20)).await;
+        assert!(result.is_err());
+    }
+}
+
+/// End-to-end tests against a fake `proxmark3` shell script, spawned through
+/// a mock Tauri app exactly like the real client. Covers the process
+/// lifecycle the parser tests can't: timeouts kill the client, cancellation
+/// is reported, and detection/flash argument shapes reach the binary.
+#[cfg(all(test, unix))]
+mod process_tests {
+    use super::*;
+    use crate::settings::{Pm3Settings, SettingsState};
+    use std::path::{Path, PathBuf};
+    use tauri::Manager;
+
+    const FAKE_PM3: &str = r#"#!/bin/sh
+dir=$(dirname "$0")
+echo $$ > "$dir/pid"
+if [ "$1" = "-p" ]; then port="$2"; else port="$1"; fi
+case "$*" in
+  *--flash*)
+    echo "[+] Entering bootloader..."
+    echo "[+] Writing segments for file: fullimage.elf"
+    echo "[+] All done"
+    exit 0 ;;
+esac
+case "$port" in
+  /dev/ttyACM0) cat "$dir/hw_version.txt"; exit 0 ;;
+  /dev/ttyACM1) echo "[!!] ERROR: capabilities mismatch" >&2; exit 1 ;;
+  /dev/ttyACM2) exec sleep 30 ;;
+  /dev/ttyACM3) echo "[+] line 1"; echo "[+] line 2"; exec sleep 30 ;;
+  *) echo "[!!] ERROR: invalid serial port $port" >&2; exit 1 ;;
+esac
+"#;
+
+    const HW_VERSION: &str = " [ Client ]\n  client: Iceman/master/v4.20728-234-g1a2b3c4d5\n [ ARM ]\n  os: Iceman/master/v4.20728-234-g1a2b3c4d5\n [ Hardware ]\n  --= uC: AT91SAM7S512 Rev B\n";
+
+    struct Fixture {
+        app: tauri::App<tauri::test::MockRuntime>,
+        dir: PathBuf,
+    }
+
+    fn fixture(name: &str, preferred_port: Option<&str>) -> Fixture {
+        use std::os::unix::fs::PermissionsExt;
+        let dir =
+            std::env::temp_dir().join(format!("phosphor-fake-pm3-{}-{}", name, std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let client = dir.join("proxmark3");
+        std::fs::write(&client, FAKE_PM3).unwrap();
+        std::fs::set_permissions(&client, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(dir.join("hw_version.txt"), HW_VERSION).unwrap();
+
+        let app = tauri::test::mock_builder()
+            .plugin(tauri_plugin_shell::init())
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        app.manage(SettingsState::new(Pm3Settings {
+            preferred_port: preferred_port.map(String::from),
+            client_path: Some(client.display().to_string()),
+        }));
+        Fixture { app, dir }
+    }
+
+    /// Wait for the fake client's PID to disappear (killed and reaped).
+    async fn assert_process_gone(dir: &Path) {
+        let pid = std::fs::read_to_string(dir.join("pid")).unwrap();
+        for _ in 0..100 {
+            let alive = std::process::Command::new("kill")
+                .args(["-0", pid.trim()])
+                .stderr(std::process::Stdio::null())
+                .status()
+                .unwrap()
+                .success();
+            if !alive {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("fake proxmark3 (pid {}) is still running", pid.trim());
+    }
+
+    #[tokio::test]
+    async fn one_shot_command_returns_output() {
+        let f = fixture("ok", None);
+        let out = run_command(f.app.handle(), "/dev/ttyACM0", "hw version")
+            .await
+            .unwrap();
+        assert!(out.contains("AT91SAM7S512"));
+    }
+
+    #[tokio::test]
+    async fn one_shot_failure_carries_stderr() {
+        let f = fixture("fail", None);
+        let err = run_command(f.app.handle(), "/dev/ttyACM1", "hw version")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("capabilities mismatch"));
+    }
+
+    #[tokio::test]
+    async fn one_shot_timeout_kills_the_client() {
+        let f = fixture("timeout", None);
+        let err = execute_pm3_with_timeout(
+            f.app.handle(),
+            "/dev/ttyACM2",
+            "hw version",
+            Duration::from_millis(300),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, AppError::Timeout(_)));
+        assert_process_gone(&f.dir).await;
+    }
+
+    #[tokio::test]
+    async fn detection_uses_preferred_port() {
+        let f = fixture("detect", Some("/dev/ttyACM0"));
+        let (port, _model, firmware) = detect_device(f.app.handle()).await.unwrap();
+        assert_eq!(port, "/dev/ttyACM0");
+        assert_eq!(firmware, "v4.20728");
+    }
+
+    #[tokio::test]
+    async fn detection_treats_capabilities_mismatch_as_present() {
+        let f = fixture("mismatch", Some("/dev/ttyACM1"));
+        let (port, _model, firmware) = detect_device(f.app.handle()).await.unwrap();
+        assert_eq!(port, "/dev/ttyACM1");
+        assert_eq!(firmware, "mismatched");
+    }
+
+    #[tokio::test]
+    async fn streaming_cancel_kills_client_and_reports_cancelled() {
+        let f = fixture("cancel", None);
+        let state = HfOperationState::new();
+        let mut lines = Vec::new();
+
+        let run = run_command_streaming(
+            f.app.handle(),
+            "/dev/ttyACM3",
+            "hf mf autopwn",
+            60,
+            &state,
+            |l| lines.push(l.to_string()),
+        );
+        let cancel = async {
+            // Wait for the child to be parked, give it time to print, then
+            // do what cancel_hf_operation does.
+            loop {
+                if state.child.lock().unwrap().is_some() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let child = state.child.lock().unwrap().take().unwrap();
+            child.kill().unwrap();
+        };
+        let (result, ()) = tokio::join!(run, cancel);
+
+        assert!(matches!(result, Err(AppError::Cancelled)));
+        assert_eq!(lines, vec!["[+] line 1", "[+] line 2"]);
+        assert_process_gone(&f.dir).await;
+    }
+
+    #[tokio::test]
+    async fn streaming_inactivity_timeout_kills_client() {
+        let f = fixture("stall", None);
+        let state = HfOperationState::new();
+        let result = run_command_streaming(
+            f.app.handle(),
+            "/dev/ttyACM3",
+            "hf mf autopwn",
+            1,
+            &state,
+            |_| {},
+        )
+        .await;
+        assert!(matches!(result, Err(AppError::Timeout(_))));
+        assert!(state.child.lock().unwrap().is_none());
+        assert_process_gone(&f.dir).await;
+    }
+
+    #[tokio::test]
+    async fn flash_passes_port_positionally() {
+        let f = fixture("flash", None);
+        let slot = Mutex::new(None);
+        let out = run_flash(
+            f.app.handle(),
+            "/dev/ttyACM0",
+            "/tmp/fullimage.elf",
+            &slot,
+            |_| {},
+        )
+        .await
+        .unwrap();
+        assert!(out.contains("All done"));
+        assert!(slot.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn invalid_port_is_rejected_before_spawning() {
+        let f = fixture("invalid", None);
+        let err = run_command(f.app.handle(), "--flash", "hw version")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("Invalid port"));
+        assert!(!f.dir.join("pid").exists());
     }
 }

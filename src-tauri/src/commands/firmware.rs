@@ -1,13 +1,12 @@
-use std::sync::{LazyLock, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 
-use regex::Regex;
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
-use tauri_plugin_shell::ShellExt;
 
 use crate::error::AppError;
-use crate::pm3::connection;
 use crate::pm3::version::parse_detailed_hw_version;
+use crate::pm3::{connection, ports};
 
 // ---------------------------------------------------------------------------
 // State — holds the running flash child process (if any) for cancellation
@@ -16,12 +15,16 @@ use crate::pm3::version::parse_detailed_hw_version;
 /// Managed state for the flash subprocess. Stored via `app.manage()`.
 pub struct FlashState {
     pub child: Mutex<Option<tauri_plugin_shell::process::CommandChild>>,
+    /// Set for the whole duration of `flash_firmware`, including before the
+    /// child is spawned, so concurrent flash requests are rejected.
+    pub active: AtomicBool,
 }
 
 impl FlashState {
     pub fn new() -> Self {
         Self {
             child: Mutex::new(None),
+            active: AtomicBool::new(false),
         }
     }
 }
@@ -53,11 +56,6 @@ pub struct FirmwareProgress {
 // ---------------------------------------------------------------------------
 
 const VALID_VARIANTS: &[&str] = &["rdv4", "rdv4-bt", "generic", "generic-256"];
-
-static PORT_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^(COM[1-9]\d*|/dev/tty(ACM|USB)\d{1,2}|/dev/tty\.usbmodem\w+)$")
-        .expect("bad port regex")
-});
 
 // ---------------------------------------------------------------------------
 // Commands
@@ -102,15 +100,16 @@ pub async fn check_firmware_version(
     })
 }
 
-/// Start flashing firmware to the connected PM3 device.
+/// Flash firmware to the connected PM3 device.
 ///
-/// Spawns the sidecar binary in flash mode and streams progress to the
-/// frontend via Tauri events:
+/// Streams progress to the frontend via Tauri events:
 /// - `firmware-progress` — phase/percent updates during flash
 /// - `firmware-complete` — flash finished successfully
 /// - `firmware-failed` — flash failed with error
 ///
-/// Returns immediately after spawning. Use `cancel_flash` to abort.
+/// Resolves when the flash ends. The client process is held in `FlashState`
+/// so `cancel_flash` can abort it; a cancelled flash emits no completion
+/// event because the frontend has already left the flashing step.
 #[tauri::command]
 pub async fn flash_firmware(
     app: AppHandle,
@@ -118,20 +117,8 @@ pub async fn flash_firmware(
     hardware_variant: String,
     flash_state: State<'_, FlashState>,
 ) -> Result<(), AppError> {
-    // Reject if a flash is already running
-    {
-        let lock = flash_state.child.lock().map_err(|e| {
-            AppError::CommandFailed(format!("Flash state lock poisoned: {}", e))
-        })?;
-        if lock.is_some() {
-            return Err(AppError::CommandFailed(
-                "A firmware flash is already in progress".into(),
-            ));
-        }
-    }
-
     // Validate port
-    if !PORT_RE.is_match(&port) {
+    if !ports::is_valid_port(&port) {
         return Err(AppError::CommandFailed(format!("Invalid port: {}", port)));
     }
 
@@ -167,126 +154,68 @@ pub async fn flash_firmware(
         .unwrap_or(&fw_path.to_string_lossy())
         .to_string();
 
-    // Emit initial progress
-    let _ = app.emit(
-        "firmware-progress",
-        FirmwareProgress {
-            phase: "connecting".into(),
-            percent: 5,
-            message: "Connecting to device...".into(),
-        },
-    );
+    // Reject if a flash is already running. Two clients talking to the same
+    // bootloader at once can leave the device half-flashed.
+    if flash_state.active.swap(true, Ordering::SeqCst) {
+        return Err(AppError::CommandFailed(
+            "A firmware flash is already in progress".into(),
+        ));
+    }
+    let _active = ActiveFlashGuard(&flash_state.active);
 
-    let flash_args = [
-        port.as_str(),
-        "--flash",
-        "--image",
-        fw_path_str.as_str(),
-        "-w",
-    ];
+    emit_progress(&app, "connecting", 5, "Connecting to device...");
 
-    // Try sidecar first (works in dev mode). In NSIS installs the sidecar
-    // binary lives in the root install dir, NOT in binaries/, so the sidecar
-    // lookup fails with os error 3. Fall back to scope-based lookup — same
-    // strategy as connection::run_command().
-    let sidecar_result = match app.shell().sidecar("binaries/proxmark3") {
-        Ok(cmd) => cmd.args(&flash_args).output().await.ok(),
-        Err(_) => None,
-    };
-
-    let output = if let Some(output) = sidecar_result {
-        output
-    } else {
-        // Sidecar not available — try scope names (PATH, common install paths)
-        let scope_names: Vec<&str> = if cfg!(target_os = "windows") {
-            vec!["proxmark3", "proxmark3-win-c", "proxmark3-win-progfiles"]
-        } else if cfg!(target_os = "macos") {
-            vec!["proxmark3", "proxmark3-mac-local", "proxmark3-mac-brew"]
-        } else {
-            vec!["proxmark3", "proxmark3-linux-local", "proxmark3-linux-usr"]
-        };
-
-        let _ = app.emit(
-            "firmware-progress",
-            FirmwareProgress {
-                phase: "writing".into(),
-                percent: 30,
-                message: "Flashing firmware (this may take up to 60 seconds)...".into(),
-            },
-        );
-
-        let mut last_err = String::from("No PM3 binary found");
-        let mut found = None;
-        for name in &scope_names {
-            match app.shell().command(name).args(&flash_args).output().await {
-                Ok(out) => {
-                    found = Some(out);
-                    break;
-                }
-                Err(e) => {
-                    last_err = format!("{}: {}", name, e);
-                }
+    let mut percent = 5u8;
+    let mut last_line = String::new();
+    let result = connection::run_flash(&app, &port, &fw_path_str, &flash_state.child, |line| {
+        last_line = line.to_string();
+        if let Some((phase, pct, message)) = flash_milestone(line) {
+            if pct > percent {
+                percent = pct;
+                emit_progress(&app, phase, pct, message);
             }
         }
+    })
+    .await;
 
-        match found {
-            Some(out) => out,
-            None => {
-                let _ = app.emit(
-                    "firmware-failed",
-                    FirmwareProgress {
-                        phase: "error".into(),
-                        percent: 0,
-                        message: format!("PM3 binary not found for flash: {}", last_err),
-                    },
-                );
-                return Ok(());
-            }
+    match result {
+        Ok(_) => {
+            let _ = app.emit(
+                "firmware-complete",
+                FirmwareProgress {
+                    phase: "done".into(),
+                    percent: 100,
+                    message: "Firmware flash complete!".into(),
+                },
+            );
         }
-    };
-
-    // Process flash result
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-
-    if !stdout.is_empty() {
-        connection::emit_output(&app, &stdout, false);
-    }
-    if !stderr.is_empty() {
-        connection::emit_output(&app, &stderr, true);
-    }
-
-    let success = output.status.success();
-    let event_name = if success {
-        "firmware-complete"
-    } else {
-        "firmware-failed"
-    };
-    let _ = app.emit(
-        event_name,
-        FirmwareProgress {
-            phase: if success { "done" } else { "error" }.into(),
-            percent: if success { 100 } else { 0 },
-            message: if success {
-                "Firmware flash complete!".into()
-            } else if !stderr.is_empty() {
-                stderr
-                    .lines()
-                    .last()
-                    .unwrap_or("Flash failed")
-                    .to_string()
+        Err(AppError::Cancelled) => {}
+        Err(e) => {
+            let message = if last_line.is_empty() {
+                e.to_string()
             } else {
-                format!("Flash failed (exit code: {:?})", output.status.code())
-            },
-        },
-    );
+                last_line
+            };
+            let _ = app.emit(
+                "firmware-failed",
+                FirmwareProgress {
+                    phase: "error".into(),
+                    percent: 0,
+                    message,
+                },
+            );
+        }
+    }
 
     Ok(())
 }
 
 /// Cancel an in-progress firmware flash by killing the child process.
 #[tauri::command]
-pub async fn cancel_flash(flash_state: State<'_, FlashState>) -> Result<(), AppError> {
+pub async fn cancel_flash(
+    app: AppHandle,
+    flash_state: State<'_, FlashState>,
+) -> Result<(), AppError> {
     let child = {
         let mut lock = flash_state.child.lock().map_err(|e| {
             AppError::CommandFailed(format!("Flash state lock poisoned: {}", e))
@@ -299,6 +228,11 @@ pub async fn cancel_flash(flash_state: State<'_, FlashState>) -> Result<(), AppE
             child.kill().map_err(|e| {
                 AppError::CommandFailed(format!("Failed to kill flash process: {}", e))
             })?;
+            connection::emit_output(
+                &app,
+                "[!] Flash aborted. If the PM3 stays in bootloader mode, flash again to recover.",
+                true,
+            );
             Ok(())
         }
         None => Ok(()), // No flash running — no-op
@@ -308,6 +242,44 @@ pub async fn cancel_flash(flash_state: State<'_, FlashState>) -> Result<(), AppE
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
+
+/// Clears `FlashState::active` when the flash command returns, on any path.
+struct ActiveFlashGuard<'a>(&'a AtomicBool);
+
+impl Drop for ActiveFlashGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
+fn emit_progress(app: &AppHandle, phase: &str, percent: u8, message: &str) {
+    let _ = app.emit(
+        "firmware-progress",
+        FirmwareProgress {
+            phase: phase.into(),
+            percent,
+            message: message.into(),
+        },
+    );
+}
+
+/// Map PM3 client flash output to coarse progress milestones.
+fn flash_milestone(line: &str) -> Option<(&'static str, u8, &'static str)> {
+    let lower = line.to_ascii_lowercase();
+    if lower.contains("all done") {
+        Some(("verifying", 95, "Finishing up..."))
+    } else if lower.contains("writing segments") || lower.contains("flashing") {
+        Some((
+            "writing",
+            40,
+            "Writing firmware (this may take up to 60 seconds)...",
+        ))
+    } else if lower.contains("bootloader") || lower.contains("waiting for proxmark3") {
+        Some(("bootloader", 20, "Entering bootloader..."))
+    } else {
+        None
+    }
+}
 
 fn firmware_file_exists(app: &AppHandle, variant: &str) -> bool {
     if !VALID_VARIANTS.contains(&variant) {
@@ -324,3 +296,18 @@ fn firmware_file_exists(app: &AppHandle, variant: &str) -> bool {
         .unwrap_or(false)
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn flash_milestones_follow_client_output() {
+        let pct = |line: &str| flash_milestone(line).map(|m| m.1);
+        assert_eq!(pct("[+] Entering bootloader..."), Some(20));
+        assert_eq!(pct("[+] Waiting for Proxmark3 to appear on COM5"), Some(20));
+        assert_eq!(pct("[+] Flashing..."), Some(40));
+        assert_eq!(pct("[+] Writing segments for file: fullimage.elf"), Some(40));
+        assert_eq!(pct("[+] All done"), Some(95));
+        assert_eq!(pct("[=] Available memory on this board: 512K bytes"), None);
+    }
+}

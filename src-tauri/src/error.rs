@@ -13,6 +13,8 @@ pub enum AppError {
     InvalidTransition(String),
     #[error("Timeout: {0}")]
     Timeout(String),
+    #[error("Operation cancelled")]
+    Cancelled,
 }
 
 impl From<rusqlite::Error> for AppError {

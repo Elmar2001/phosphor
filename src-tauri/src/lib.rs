@@ -3,12 +3,14 @@ mod commands;
 mod db;
 mod error;
 mod pm3;
+mod settings;
 mod state;
 
 use std::sync::Mutex;
 
 use commands::firmware::FlashState;
 use pm3::connection::HfOperationState;
+use settings::SettingsState;
 use state::WizardMachine;
 use tauri::Manager;
 
@@ -24,6 +26,7 @@ pub fn run() {
                 .expect("failed to resolve app data dir");
             let database =
                 db::Database::open(data_dir).expect("failed to open database");
+            app.manage(SettingsState::load(&database));
             app.manage(database);
             app.manage(Mutex::new(WizardMachine::new()));
             app.manage(FlashState::new());
@@ -33,6 +36,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::wizard::get_wizard_state,
             commands::wizard::wizard_action,
+            settings::get_pm3_settings,
+            settings::set_pm3_settings,
             commands::device::detect_device,
             commands::blank::detect_blank,
             commands::scan::scan_card,

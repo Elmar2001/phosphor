@@ -187,6 +187,9 @@ pub async fn hf_autopwn(
             m.transition(WizardAction::HfProcessComplete { dump_info })?;
             Ok(m.current.clone())
         }
+        // cancel_hf_operation killed the process; the frontend's
+        // CancelHfProcess action owns the state transition.
+        Err(AppError::Cancelled) => Err(AppError::Cancelled),
         Err(e) => {
             let mut m = machine.lock().map_err(|e| {
                 AppError::CommandFailed(format!("State lock poisoned: {}", e))
