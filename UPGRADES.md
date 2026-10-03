@@ -22,7 +22,7 @@ This replaces an earlier upgrade attempt (commits `6e6393a` through
 | Setup problems | "Device not found" for everything | DIAG tab: client launch check, real port list, firmware, overrides, copyable report |
 | Overrides | None | Preferred port and custom client path in Settings, stored in the database |
 | Webview permissions | Could spawn `proxmark3` with any arguments | No shell permissions |
-| Tests | 225 Rust parser/builder tests | 272 Rust tests (incl. fake-client process tests) + 24 frontend tests |
+| Tests | 225 Rust parser/builder tests | 273 Rust tests (incl. fake-client process tests) + 24 frontend tests |
 | CI | None | Linux, Windows, macOS on every push to `master` and every PR |
 
 ## Changes in detail
@@ -50,7 +50,7 @@ first match wins:
    `/opt/homebrew/bin`, `/usr/local/bin`, `/opt/local/bin` (MacPorts, new);
    `/usr/local/bin`, `/usr/bin`.
 
-### Process lifecycle — `dee81d9`, `d0cc051`, `2f10938`
+### Process lifecycle — `dee81d9`, `d0cc051`, `2f10938`, `8735d5a`
 
 All launches go through one spawn function in `pm3/connection.rs`.
 
@@ -174,7 +174,7 @@ calls.
 
 ### Tests — `dee81d9`, `af76184`, `64d33a9`, `9f500a7`
 
-- **Rust: 272** (225 upstream + 47 new), covering client lookup and path
+- **Rust: 273** (225 upstream + 48 new), covering client lookup and path
   validation, port validation and probe order, settings, diagnostics checks,
   flash milestones and stream event ordering.
 - **Fake-client process tests** (`connection.rs::process_tests`, Unix):
@@ -228,6 +228,12 @@ calls.
   failed on Linux in `flash_passes_port_positionally`. That exposed the
   trailing-output race above, fixed in `2f10938`. Before the fix it failed
   about 1 run in 20 under parallel load; after it, 300/300 runs passed.
+- **Windows test-binary load failure fixed:** the new ordering tests used a
+  mock Tauri app, and on Windows that made the whole test executable fail to
+  load (`0xC0000139`, comctl32 imports without an app manifest). The stream
+  reader no longer needs an `AppHandle` (`8735d5a`), so those tests run on
+  every OS without Tauri. The mock app stays limited to the Unix-only
+  process tests.
 - **Locally (Linux):** `./scripts/check.sh` passes, and `cargo check`
   passes with no sidecar, DLL or firmware files present.
 - **Fixes proven by their tests:** the timeout-kill, cancelled-autopwn and
