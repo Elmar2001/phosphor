@@ -9,6 +9,7 @@
     "build": "tsc && vite build",
     "test": "vitest run",
     "test:watch": "vitest",
+    "release:check": "node scripts/release-check.mjs",
     "preview": "vite preview",
     "tauri": "tauri"
   },
