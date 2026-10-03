@@ -2,7 +2,7 @@
 
 Desktop GUI for Proxmark3. Scan, clone and manage RFID/NFC cards without touching the command line.
 
-![Windows](https://img.shields.io/badge/Windows-10%2B-blue) ![License](https://img.shields.io/badge/license-GPL--3.0-green) ![Version](https://img.shields.io/badge/version-1.1.0-brightgreen)
+![Windows](https://img.shields.io/badge/Windows-10%2B-blue) ![macOS](https://img.shields.io/badge/macOS-from%20source-lightgrey) ![Linux](https://img.shields.io/badge/Linux-from%20source-lightgrey) ![License](https://img.shields.io/badge/license-GPL--3.0-green) ![Version](https://img.shields.io/badge/version-1.1.0-brightgreen)
 
 ## What it does
 
@@ -27,10 +27,10 @@ T5577 (LF), Gen1a, Gen2/CUID, Gen3, Gen4 GTU, Gen4 GDM/USCUID (HF)
 ## Requirements
 
 - **Proxmark3** device (Easy, RDV4, or compatible clone)
-- **Windows 10** or later (x64)
+- **Windows 10** or later (x64). macOS 10.15+ and Linux can build from source
 - USB cable (data cable, not charge-only)
 
-Proxmark3 firmware v4.20728+ recommended. Phosphor bundles its own PM3 client binary, so you don't need a separate Proxmark3 installation.
+Proxmark3 firmware v4.20728+ recommended. The Windows installer bundles its own PM3 client, so you don't need a separate Proxmark3 installation. macOS and Linux builds use an installed [Iceman proxmark3 client](https://github.com/RfidResearchGroup/proxmark3) (Homebrew, PATH, or a path set in Settings). See [Platform setup](docs/platform-setup.md).
 
 ## Installation
 
@@ -46,23 +46,26 @@ Proxmark3 firmware v4.20728+ recommended. Phosphor bundles its own PM3 client bi
 - **MIFARE Classic autopwn** with live progress (dictionary, nested, darkside, hardnested attacks)
 - **Magic card detection** identifies Gen1a through Gen4 GDM
 - **Blank card data check** warns if the blank already has data written to it
-- **Firmware flash** with variant picker (RDV4, RDV4+BT, Generic)
+- **Firmware flash** with variant picker (RDV4, RDV4+BT, Generic, Generic 256K)
+- **Diagnostics** tab: checks the PM3 client starts, lists serial ports (Proxmark3 flagged by USB ID), copies a report for bug reports
 - **T5577 chip detection** and password-protected chip handling
 - **Sound effects** and terminal-style UI
 
 ## Building from source
 
 ```bash
-# Prerequisites: Node.js 18+, Rust 1.70+, Proxmark3 client binary
+# Prerequisites: Node.js 20+, Rust 1.80+, Tauri system deps for your OS
 
 git clone https://github.com/nikitaart2000/phosphor.git
 cd phosphor
 npm install
 npx tauri dev      # development
-npx tauri build    # production build
+npx tauri build    # production build (NSIS on Windows, .app/.dmg on macOS)
 ```
 
-The PM3 client binary and its DLLs go in `src-tauri/binaries/` and `src-tauri/pm3-libs/`. See `tauri.conf.json` for the resource mapping.
+Checks: `npm test` (frontend), `cd src-tauri && cargo test` (backend), or everything at once with `./scripts/check.sh` / `pwsh scripts/check.ps1`.
+
+Windows builds bundle the PM3 client: put it at `src-tauri/binaries/proxmark3-x86_64-pc-windows-msvc.exe` and its DLLs in `src-tauri/pm3-libs/` (see `tauri.windows.conf.json`). Firmware images go in `src-tauri/firmware/<variant>/fullimage.elf`. Run `npm run release:check` before publishing. Details in [Releasing](docs/releasing.md).
 
 ## Tech stack
 
