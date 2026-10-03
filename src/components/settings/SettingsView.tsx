@@ -1,6 +1,7 @@
 import { useSettings } from '../../hooks/useSettings';
 import { useSfx } from '../../hooks/useSfx';
 import { TerminalPanel } from '../shared/TerminalPanel';
+import { Pm3RuntimeSettings } from './Pm3RuntimeSettings';
 
 export function SettingsView() {
   const { settings, updateSettings } = useSettings();
@@ -16,7 +17,7 @@ export function SettingsView() {
 
   return (
     <TerminalPanel title="SETTINGS">
-      <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
+      <div style={{ display: 'flex', flexDirection: 'column', gap: '20px' }}>
         {/* Expert Mode */}
         <div>
           <div style={{ color: 'var(--green-mid)', fontSize: '13px', fontWeight: 600 }}>
@@ -48,6 +49,8 @@ export function SettingsView() {
             </span>
           </div>
         </div>
+
+        <Pm3RuntimeSettings />
       </div>
     </TerminalPanel>
   );
