@@ -353,12 +353,9 @@ where
         }
     };
 
-    {
-        let mut lock = child_slot
-            .lock()
-            .map_err(|e| AppError::CommandFailed(format!("Process state lock poisoned: {}", e)))?;
-        *lock = Some(child);
-    }
+    // Never bail out between spawn and parking the child: an untracked
+    // client can't be cancelled or killed.
+    *child_slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(child);
 
     let result = read_stream_with_timeout(app, rx, inactivity_timeout, &mut on_line).await;
 

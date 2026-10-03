@@ -164,8 +164,15 @@ pub async fn flash_firmware(
     let _active = ActiveFlashGuard(&flash_state.active);
 
     emit_progress(&app, "connecting", 5, "Connecting to device...");
+    emit_progress(
+        &app,
+        "writing",
+        30,
+        "Flashing firmware (this may take up to 60 seconds)...",
+    );
 
-    let mut percent = 5u8;
+    // Milestones parsed from client output only ever move the bar forward.
+    let mut percent = 30u8;
     let mut last_line = String::new();
     let result = connection::run_flash(&app, &port, &fw_path_str, &flash_state.child, |line| {
         last_line = line.to_string();
@@ -269,13 +276,9 @@ fn flash_milestone(line: &str) -> Option<(&'static str, u8, &'static str)> {
     if lower.contains("all done") {
         Some(("verifying", 95, "Finishing up..."))
     } else if lower.contains("writing segments") || lower.contains("flashing") {
-        Some((
-            "writing",
-            40,
-            "Writing firmware (this may take up to 60 seconds)...",
-        ))
+        Some(("writing", 60, "Writing firmware..."))
     } else if lower.contains("bootloader") || lower.contains("waiting for proxmark3") {
-        Some(("bootloader", 20, "Entering bootloader..."))
+        Some(("bootloader", 40, "Entering bootloader..."))
     } else {
         None
     }
@@ -303,10 +306,10 @@ mod tests {
     #[test]
     fn flash_milestones_follow_client_output() {
         let pct = |line: &str| flash_milestone(line).map(|m| m.1);
-        assert_eq!(pct("[+] Entering bootloader..."), Some(20));
-        assert_eq!(pct("[+] Waiting for Proxmark3 to appear on COM5"), Some(20));
-        assert_eq!(pct("[+] Flashing..."), Some(40));
-        assert_eq!(pct("[+] Writing segments for file: fullimage.elf"), Some(40));
+        assert_eq!(pct("[+] Entering bootloader..."), Some(40));
+        assert_eq!(pct("[+] Waiting for Proxmark3 to appear on COM5"), Some(40));
+        assert_eq!(pct("[+] Flashing..."), Some(60));
+        assert_eq!(pct("[+] Writing segments for file: fullimage.elf"), Some(60));
         assert_eq!(pct("[+] All done"), Some(95));
         assert_eq!(pct("[=] Available memory on this board: 512K bytes"), None);
     }
