@@ -360,7 +360,11 @@ where
     // client can't be cancelled or killed.
     *child_slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(child);
 
-    let result = read_stream_with_timeout(app, rx, inactivity_timeout, &mut on_line).await;
+    let result = read_stream_with_timeout(rx, inactivity_timeout, &mut |line, is_error| {
+        emit_output(app, line, is_error);
+        on_line(line);
+    })
+    .await;
 
     let child = child_slot.lock().unwrap_or_else(|e| e.into_inner()).take();
     let Some(child) = child else {
@@ -379,16 +383,17 @@ where
     }
 }
 
-/// Read from a `CommandEvent` receiver, accumulating output and emitting lines.
-/// Returns the full cleaned output when the process terminates.
-async fn read_stream_with_timeout<R: Runtime, F>(
-    app: &AppHandle<R>,
+/// Read from a `CommandEvent` receiver until the process exits, passing each
+/// cleaned, non-empty line to `on_line(line, is_error)`. Returns the
+/// accumulated output. Kept free of `AppHandle` so it can be unit-tested
+/// without a Tauri runtime.
+async fn read_stream_with_timeout<F>(
     mut rx: tauri::async_runtime::Receiver<CommandEvent>,
     inactivity_timeout: Duration,
     on_line: &mut F,
 ) -> Result<String, AppError>
 where
-    F: FnMut(&str),
+    F: FnMut(&str, bool),
 {
     let mut accumulated = String::new();
     let mut exit_code: Option<i32> = None;
@@ -417,13 +422,13 @@ where
         };
         match event {
             CommandEvent::Stdout(bytes) => {
-                handle_stream_line(app, &bytes, false, on_line, &mut accumulated);
+                handle_stream_line(&bytes, false, on_line, &mut accumulated);
             }
             CommandEvent::Stderr(bytes) => {
-                handle_stream_line(app, &bytes, true, on_line, &mut accumulated);
+                handle_stream_line(&bytes, true, on_line, &mut accumulated);
             }
             CommandEvent::Error(msg) => {
-                emit_output(app, &msg, true);
+                // run_streaming emits the returned error to the terminal.
                 return Err(AppError::CommandFailed(format!("Process error: {}", msg)));
             }
             CommandEvent::Terminated(payload) => {
@@ -450,21 +455,15 @@ where
     }
 }
 
-fn handle_stream_line<R: Runtime, F>(
-    app: &AppHandle<R>,
-    bytes: &[u8],
-    is_error: bool,
-    on_line: &mut F,
-    accumulated: &mut String,
-) where
-    F: FnMut(&str),
+fn handle_stream_line<F>(bytes: &[u8], is_error: bool, on_line: &mut F, accumulated: &mut String)
+where
+    F: FnMut(&str, bool),
 {
     let line = String::from_utf8_lossy(bytes);
     let cleaned = strip_ansi(&line);
     let trimmed = cleaned.trim();
     if !trimmed.is_empty() {
-        emit_output(app, trimmed, is_error);
-        on_line(trimmed);
+        on_line(trimmed, is_error);
         accumulated.push_str(trimmed);
         accumulated.push('\n');
     }
@@ -763,7 +762,6 @@ mod tests {
 
     #[tokio::test]
     async fn stream_keeps_output_that_arrives_after_termination() {
-        let app = tauri::test::mock_app();
         let (tx, rx) = tauri::async_runtime::channel(8);
         tx.send(CommandEvent::Stdout(b"[+] Flashing...\n".to_vec()))
             .await
@@ -780,19 +778,52 @@ mod tests {
         drop(tx);
 
         let mut lines = Vec::new();
-        let out =
-            read_stream_with_timeout(app.handle(), rx, Duration::from_secs(5), &mut |l: &str| {
-                lines.push(l.to_string())
-            })
-            .await
-            .unwrap();
+        let out = read_stream_with_timeout(rx, Duration::from_secs(5), &mut |l: &str, _| {
+            lines.push(l.to_string())
+        })
+        .await
+        .unwrap();
         assert!(out.contains("All done"));
         assert_eq!(lines, vec!["[+] Flashing...", "[+] All done"]);
     }
 
     #[tokio::test]
+    async fn stream_marks_stderr_lines_and_cleans_ansi() {
+        let (tx, rx) = tauri::async_runtime::channel(8);
+        tx.send(CommandEvent::Stdout(b"\x1b[32m[+] ok\x1b[0m\n".to_vec()))
+            .await
+            .unwrap();
+        tx.send(CommandEvent::Stderr(b"[!!] warn\n".to_vec()))
+            .await
+            .unwrap();
+        tx.send(CommandEvent::Stdout(b"   \n".to_vec()))
+            .await
+            .unwrap();
+        tx.send(CommandEvent::Terminated(TerminatedPayload {
+            code: Some(0),
+            signal: None,
+        }))
+        .await
+        .unwrap();
+        drop(tx);
+
+        let mut lines = Vec::new();
+        read_stream_with_timeout(rx, Duration::from_secs(5), &mut |l: &str, is_error| {
+            lines.push((l.to_string(), is_error))
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            lines,
+            vec![
+                ("[+] ok".to_string(), false),
+                ("[!!] warn".to_string(), true)
+            ]
+        );
+    }
+
+    #[tokio::test]
     async fn stream_stops_draining_after_grace_period() {
-        let app = tauri::test::mock_app();
         let (tx, rx) = tauri::async_runtime::channel(8);
         tx.send(CommandEvent::Terminated(TerminatedPayload {
             code: Some(0),
@@ -802,10 +833,9 @@ mod tests {
         .unwrap();
         // `tx` stays alive, like a pipe held open by a leftover grandchild.
         let started = std::time::Instant::now();
-        let out =
-            read_stream_with_timeout(app.handle(), rx, Duration::from_secs(60), &mut |_: &str| {})
-                .await
-                .unwrap();
+        let out = read_stream_with_timeout(rx, Duration::from_secs(60), &mut |_: &str, _| {})
+            .await
+            .unwrap();
         assert!(out.is_empty());
         assert!(started.elapsed() < Duration::from_secs(10));
         drop(tx);
