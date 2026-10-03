@@ -1,6 +1,7 @@
 import { TerminalPanel } from '../shared/TerminalPanel';
 import { useSfx } from '../../hooks/useSfx';
 import type { RecoveryAction } from '../../machines/types';
+import { currentPlatform, getDetectHints } from '../../lib/platformSupport';
 
 interface ErrorStepProps {
   message?: string | null;
@@ -27,12 +28,7 @@ function getRetryLabel(action: RecoveryAction | null | undefined, source?: strin
   }
 }
 
-const DETECT_HINTS = [
-  'Try a different USB cable (some cables are charge-only)',
-  'Check Device Manager for a COM port (Ports section)',
-  'PM3 Easy may need CH340 driver — download from wch-ic.com',
-  'Antivirus may block proxmark3.exe — add it to exceptions',
-];
+const DETECT_HINTS = getDetectHints(currentPlatform());
 
 export function ErrorStep({ message, recoverable, recoveryAction, errorSource, onRetry, onReset }: ErrorStepProps) {
   const sfx = useSfx();
